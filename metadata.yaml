@@ -1,0 +1,53 @@
+name: astrbot_plugin_dsh_bridge
+display_name: DSH Bridge · AstrBot ↔ DeepSeek Harness 桥接
+short_desc: 让 AstrBot 智能体直接驱动本机/局域网上的 DeepSeek Harness（DSH）智能体：自动扫描 127.0.0.1 端口、任务投递与结果回传、自动 prompt 注入。
+desc: |-
+  # DSH Bridge —— AstrBot ↔ DeepSeek Harness 桥接插件
+
+  让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**：
+
+  - **LLM 工具注入**：AstrBot 主智能体自动获得 `dsh_ask`（把任务投递给 DSH 智能体并取回最终回复）与 `dsh_ping`（连通性检测）两个函数工具；
+  - **Prompt 注入**：通过 `on_llm_request` 钩子向主智能体每次 LLM 请求的系统提示词自动追加使用说明（可开关、可自定义文本）；
+  - **端口自动发现**：扫描 `127.0.0.1` 回环端口（默认 59934 优先）用 HTTP 指纹识别 DSH Web 服务，DSH 侧零安装、零密钥；
+  - **跨设备适配**：Windows / Linux / macOS / Docker 通用；AstrBot 与 DSH 不在同一台设备时，配置 `dsh_host` 为 DSH 所在设备的局域网 IP 即可；
+  - **管理员命令**：`/dsh help` `/dsh ping` `/dsh scan` `/dsh status` `/dsh ask <任务>` `/dsh session <会话ID> <任务>`；
+  - **健壮性**：任务超时自动取消、结果长度截断防撑爆上下文、发现结果缓存、后台预热扫描。
+
+  ## 快速开始
+
+  1. 在 AstrBot 插件市场安装本插件并启用；
+  2. 确认 DeepSeek Harness（DSH Desktop / dsh web）正在运行；
+  3. 聊天中执行 `/dsh ping` 验证连通，`/dsh ask 帮我在电脑上查一下磁盘空间` 试跑；
+  4. 或直接正常对话，主智能体会自动通过 `dsh_ask` 工具调用 DSH。
+
+  ## 配置（插件设置页）
+
+  | 配置项 | 默认 | 说明 |
+  | --- | --- | --- |
+  | `dsh_host` | `127.0.0.1` | DSH 所在主机；跨设备时填局域网 IP |
+  | `dsh_port` | `0` | 手动指定 DSH 端口；`0` = 自动扫描 |
+  | `port_ranges` | `59900-60100,49152-60000,32768-60999` | 自动扫描区间 |
+  | `request_timeout_seconds` | `900` | 单任务执行超时，超时自动取消 |
+  | `max_result_chars` | `6000` | 返回文本截断长度 |
+  | `session_mode` | `new` | `new` 每次新建会话 / `persistent` 复用固定会话 |
+  | `inject_prompt_enabled` | `true` | 是否向主智能体注入使用说明 |
+  | `inject_prompt_text` | 内置模板 | 注入的提示词内容，可自定义 |
+
+  ## 工作原理
+
+  1. **端口发现**：先探测 DSH 默认端口 59934，再按配置区间并发扫描回环端口（TCP 连通预筛 + 页面标题 `DeepSeek Harness` / `__DSH_BOOT__` 指纹确认）；
+  2. **调用**：向 DSH `/api/<method>` 发送 JSON 信封（`session.create` → `session.prompt` → 轮询 `session.history` 至 `turn/end`，取 `assistant/message` 最终文本；超时 `session.cancel`）；
+  3. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
+
+  > DSH 本地 API 仅绑定回环地址且无鉴权，插件无需任何密钥即可驱动本机 DSH；`/dsh` 命令仅管理员可用。
+author: Fantasality
+version: 1.0.0
+repo: https://github.com/Fantasality/astrbot_plugin_dsh_bridge
+astrbot_version: ">=4.16.0"
+tags:
+  - dsh
+  - deepseek
+  - deepseek-harness
+  - bridge
+  - agent
+  - llm
