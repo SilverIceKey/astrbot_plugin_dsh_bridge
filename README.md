@@ -46,7 +46,7 @@
 
 ```bash
 cd data/plugins
-git clone <本插件仓库> astrbot_plugin_dsh_bridge
+git clone https://github.com/Fantasality/astrbot_plugin_dsh_bridge.git
 ```
 
 ## 三、配置（插件设置页，均可改后即时生效）
