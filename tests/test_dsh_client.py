@@ -13,12 +13,13 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 from aiohttp import web
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dsh_client import DshClient, _b64url_decode, _is_loopback_host  # noqa: E402
+from dsh_client import DshClient, DshError, _b64url_decode, _is_loopback_host  # noqa: E402
 
 
 def b64url(data: bytes) -> str:
@@ -270,6 +271,121 @@ class LegacyServerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["text"], "OK")
         self.assertEqual(result["sessionId"], "session-test")
         self.assertEqual(result["reason"], "turn-end")
+
+
+async def _start_app(app: web.Application) -> tuple[web.AppRunner, int]:
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    return runner, port
+
+
+def _legacy_app() -> web.Application:
+    async def index(request):
+        return web.Response(
+            text="<html><head><title>DeepSeek Harness</title></head><body>__DSH_BOOT__</body></html>",
+            content_type="text/html",
+        )
+
+    async def api(request):
+        method = request.match_info["method"]
+        await request.json()
+        values = {
+            "session.list": {"items": [{"sessionId": "s1", "running": False}]},
+            "host.describe": {"name": "mock", "version": "0.1.0"},
+            "session.create": {"sessionId": "session-test"},
+            "session.prompt": {"accepted": True},
+            "session.cancel": {"accepted": True},
+            "session.history": {
+                "events": [
+                    {
+                        "event": {
+                            "type": "assistant/message",
+                            "data": {"message": {"content": [{"type": "text", "text": "OK"}]}},
+                        }
+                    },
+                    {"event": {"type": "turn/end", "data": {}}},
+                ]
+            },
+        }
+        if method not in values:
+            return web.Response(status=404)
+        return web.json_response(
+            {"type": "server-response", "rpcId": "test", "result": {"ok": True, "value": values[method]}}
+        )
+
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_post("/api/{method:.*}", api)
+    return app
+
+
+def _page_only_app() -> web.Application:
+    """只提供带 DSH 标记的 HTML，/api 返回 HTML（前端/代理 SPA fallback 的假候选）。"""
+
+    async def index(request):
+        return web.Response(
+            text="<html><head><title>DeepSeek Harness</title></head><body>__DSH_BOOT__</body></html>",
+            content_type="text/html",
+        )
+
+    async def api(request):
+        return web.Response(text="<html><body>not an api</body></html>", content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/", index)
+    app.router.add_post("/api/{method:.*}", api)
+    return app
+
+
+class PageOnlyCandidateTests(unittest.IsolatedAsyncioTestCase):
+    """验证扫描会跳过“页面像 DSH 但 /api 不是 JSON”的假候选。"""
+
+    async def asyncSetUp(self) -> None:
+        # 隔离宿主环境里的 DSH_WEB_URL，避免扫描命中本机真实 DSH
+        self._env_patch = mock.patch.dict(os.environ, {"DSH_WEB_URL": ""})
+        self._env_patch.start()
+        self.valid_runner, self.valid_port = await _start_app(_legacy_app())
+        self.page_runner, self.page_port = await _start_app(_page_only_app())
+        self.client = DshClient(
+            {
+                "port_ranges": f"{self.page_port}-{self.page_port},{self.valid_port}-{self.valid_port}",
+                "scan_concurrency": 8,
+                "port_probe_timeout_seconds": 0.5,
+            }
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+        await self.valid_runner.cleanup()
+        await self.page_runner.cleanup()
+        self._env_patch.stop()
+
+    async def test_discover_skips_page_only_candidate(self) -> None:
+        base = await self.client.discover(force=True)
+        self.assertEqual(base, f"http://127.0.0.1:{self.valid_port}")
+
+    async def test_page_only_candidate_is_not_selected(self) -> None:
+        info = await self.client.ping()
+        self.assertEqual(info["protocol"], "legacy")
+        self.assertEqual(info["base"], f"http://127.0.0.1:{self.valid_port}")
+
+    async def test_json_error_includes_response_details(self) -> None:
+        page_base = f"http://127.0.0.1:{self.page_port}"
+        client = DshClient({"dsh_url": page_base})
+        try:
+            with self.assertRaises(DshError) as ctx:
+                await client._modern_rpc(
+                    page_base, "session/list", {"_request": {}}, timeout=5, allow_unauth=True
+                )
+        finally:
+            await client.close()
+        message = str(ctx.exception)
+        self.assertIn("不是合法 JSON", message)
+        self.assertIn("Content-Type", message)
+        self.assertIn(page_base, message)
 
 
 if __name__ == "__main__":

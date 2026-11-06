@@ -31,7 +31,7 @@ from astrbot.core.message.message_event_result import MessageChain
 
 from .dsh_client import DshClient, DshError
 
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 
 DEFAULT_INJECT_PROMPT = (
     "\n\n[DSH Bridge 系统提示]\n"

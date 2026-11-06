@@ -39,7 +39,7 @@ desc: |-
 
   ## 工作原理
 
-  1. **端口发现**：先尝试 `dsh_url`/`dsh_port`/`DSH_WEB_URL`/默认端口 59934，再按配置区间并发扫描回环端口（TCP 连通预筛 + HTTP 指纹确认，自动跟随重定向，新版返回 401 认证提示、旧版返回页面标记）；
+  1. **端口发现**：先尝试 `dsh_url`/`dsh_port`/`DSH_WEB_URL`/默认端口 59934，再按配置区间并发扫描回环端口（TCP 连通预筛 + HTTP 指纹确认，自动跟随重定向，新版返回 401 认证提示、旧版返回页面标记；200 页面候选还会校验 `/api` 是否为 JSON-RPC，跳过前端/代理假页面）；
   2. **协议识别**：先探测新版 `session/list`，失败再探测旧版 `session.list`，自动决定走哪条调用链；
   3. **认证（仅新版）**：读取 `$DSH_HOME/.credentials.yaml` 中 `client-connection/browser-session` 的签名密钥，自行签发 authority 绑定的浏览器会话 Cookie；也可用 `dsh web` 启动 URL 的 `?token=` 走 `/connect` 换取 API Cookie；
   4. **调用**：新版 `session/create` → `session/prompt` → `session/wait`；旧版 `session.create` → `session.prompt` → 轮询 `session.history` 至 `turn/end`；
@@ -48,7 +48,7 @@ desc: |-
   > DSH 本地 API 仅绑定回环地址；新版需要浏览器会话认证，插件通过本机凭据文件或启动令牌完成认证。
   > 若 DSH 任务触发「需要用户确认」的审批，插件会提示到 DSH 窗口处理；无人值守场景可在 DSH 设置里调整默认权限预设。
 author: Fantasality
-version: 1.1.1
+version: 1.1.2
 repo: https://github.com/Fantasality/astrbot_plugin_dsh_bridge
 astrbot_version: ">=4.16.0"
 tags:

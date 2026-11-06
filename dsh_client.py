@@ -540,14 +540,23 @@ class DshClient:
                         )
                     if resp.status != 200:
                         detail = (await resp.text(errors="ignore"))[:200].strip()
-                        raise DshError(f"DSH API 返回 HTTP {resp.status}（{method}）：{detail}")
-                    data = await resp.json(content_type=None)
+                        raise DshError(
+                            f"DSH API 返回 HTTP {resp.status}（{method} @ {base_url}）：{detail}"
+                        )
+                    raw = await resp.read()
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        content_type = resp.headers.get("Content-Type", "unknown")
+                        snippet = raw[:200].decode("utf-8", "replace").replace("\n", " ")
+                        raise DshError(
+                            f"DSH API 响应不是合法 JSON（{method} @ {base_url}，"
+                            f"HTTP {resp.status}，Content-Type={content_type}）：{snippet!r}"
+                        ) from exc
             except asyncio.TimeoutError as exc:
                 raise DshError(f"DSH API 调用超时（{method}）") from exc
             except aiohttp.ClientError as exc:
                 raise DshError(f"无法连接 DSH（{method}）：{exc}") from exc
-            except json.JSONDecodeError as exc:
-                raise DshError(f"DSH API 响应不是合法 JSON（{method}）") from exc
 
             result = data.get("result") if isinstance(data, dict) else None
             if not isinstance(result, dict):
@@ -594,14 +603,23 @@ class DshClient:
                     raise DshError(f"旧版 DSH 不存在方法 {method}（HTTP 404）")
                 if resp.status != 200:
                     detail = (await resp.text(errors="ignore"))[:200].strip()
-                    raise DshError(f"DSH API 返回 HTTP {resp.status}（{method}）：{detail}")
-                data = await resp.json(content_type=None)
+                    raise DshError(
+                        f"DSH API 返回 HTTP {resp.status}（{method} @ {base_url}）：{detail}"
+                    )
+                raw = await resp.read()
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    content_type = resp.headers.get("Content-Type", "unknown")
+                    snippet = raw[:200].decode("utf-8", "replace").replace("\n", " ")
+                    raise DshError(
+                        f"DSH API 响应不是合法 JSON（{method} @ {base_url}，"
+                        f"HTTP {resp.status}，Content-Type={content_type}）：{snippet!r}"
+                    ) from exc
         except asyncio.TimeoutError as exc:
             raise DshError(f"DSH API 调用超时（{method}）") from exc
         except aiohttp.ClientError as exc:
             raise DshError(f"无法连接 DSH（{method}）：{exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise DshError(f"DSH API 响应不是合法 JSON（{method}）") from exc
 
         result = data.get("result") if isinstance(data, dict) else None
         if not isinstance(result, dict):
@@ -720,6 +738,30 @@ class DshClient:
         except Exception:
             return None
 
+    async def _api_works(self, base_url: str) -> bool:
+        """校验候选地址的 /api 是否真的返回 JSON-RPC 结果。
+
+        200 页面指纹并不等于 DSH API：前端静态页、开发服务器或反向代理的
+        SPA fallback 也会返回带 DSH 标记的 HTML，但 /api/* 返回 HTML，导致
+        session.create 报“不是合法 JSON”。这里用一次轻量 RPC 排除这类假候选。
+        """
+        try:
+            await self._modern_rpc(
+                base_url, "session/list", {"_request": {}}, timeout=6, allow_unauth=True
+            )
+            self._protocol = PROTOCOL_MODERN
+            self._protocol_base = base_url
+            return True
+        except DshError:
+            pass
+        try:
+            await self._legacy_rpc(base_url, "session.list", {}, timeout=6)
+            self._protocol = PROTOCOL_LEGACY
+            self._protocol_base = base_url
+            return True
+        except DshError:
+            return False
+
     async def _port_open(self, port: int) -> bool:
         try:
             _, writer = await asyncio.wait_for(
@@ -784,13 +826,30 @@ class DshClient:
                 f"🔍 开始扫描 {self.host}（共 {len(ordered)} 个候选端口，优先显式地址/默认端口）…"
             )
 
+        fallback_page: str | None = None
+        fallback_lock = asyncio.Lock()
+
         async def try_candidate(port: int | None, base: str) -> str | None:
+            nonlocal fallback_page
             if port is not None and not await self._port_open(port):
                 return None
             kind = await self._probe(base)
-            if kind:
-                self._probe_kinds[base] = kind
+            if not kind:
+                return None
+            self._probe_kinds[base] = kind
+            if kind == "modern":
+                # 401 认证提示是 DSH 0.2.x API 的强特征，无需认证即可确认
                 return base
+            # 200 页面可能只是前端/代理的 SPA fallback，需校验 /api 真的可调用
+            if await self._api_works(base):
+                return base
+            async with fallback_lock:
+                if fallback_page is None:
+                    fallback_page = base
+                    self.logger.warning(
+                        f"[DSH Bridge] {base} 页面像 DSH，但 /api 不是 JSON-RPC（可能是前端/代理页面），"
+                        "继续扫描其他端口。"
+                    )
             return None
 
         priority = ordered[:8]
@@ -821,7 +880,10 @@ class DshClient:
             scanned += len(batch)
             if progress and index % 4 == 0:
                 await progress(f"🔍 扫描中… 已检查 {scanned}/{total} 个端口")
-        return None
+
+        # 没有找到可调用 API 的地址时，仍返回页面候选（dsh_ping 会显示已连接，
+        # dsh_ask 的报错会带上 HTTP 状态/Content-Type/响应片段，便于定位）。
+        return fallback_page
 
     # -------------------------------------------------------------- 会话操作
 
