@@ -1,65 +1,36 @@
-"""DSH Bridge - DeepSeek Harness 本地 API 客户端（适配 DSH 0.2.2-rc.1+）。
+"""DSH Bridge - DeepSeek Harness 本地 API 客户端。
 
-本模块封装 DSH（DeepSeek Harness）宿主进程暴露在环回地址/局域网上的 HTTP API，
-让 AstrBot 插件无需在 DSH 侧安装任何组件，即可把任务投递给 DSH 智能体并取回结果。
+同时兼容两代 DSH 接口：
 
-协议说明（依据 @deepseek-ai/dsh 0.2.2-rc.1 源码与本机实测）:
+  1) DSH 0.2.2-rc.1+（新协议）
+     - /api 需要浏览器会话认证：读取 DSH 数据目录 .credentials.yaml 中
+       client-connection/browser-session 的签名密钥，自行签发 v1 浏览器 Cookie；
+       或使用 `dsh web` 启动 URL 的 ?token= 经 /connect 换取 API Cookie。
+     - 方法名使用斜杠命名、参数使用命名参数信封：
+         POST /api/<method>
+         {"type":"client-request","rpcId":...,"method":...,"payload":{"args":{...}}}
+       session/create、session/list、session/state、session/prompt、session/wait、session/cancel
+     - 完成判定：session/wait 等到空闲，output.records 中取 assistant/message 文本。
 
-    1) 发现
-       GET  /                       未认证时返回 401 文本
-                                    "dsh web authentication required; ..."；
-                                    认证后返回 SPA index.html，含 __DSH_BOOT__ 标记与
-                                    release.version。DSH Desktop 以 --port 0 启动，
-                                    端口通常落在系统临时端口段，因此默认扫描 32768-65535。
+  2) 旧版 DSH（0.1.x / 早期 0.2.x，无认证）
+     - GET / 直接返回含 "DeepSeek Harness" / "__DSH_BOOT__" 的 index.html；
+     - 方法名使用点号命名、payload 直接是参数对象：
+         session.create、session.list、session.prompt、session.history、session.cancel、host.describe
+     - 完成判定：轮询 session.history，直到出现 turn/end 事件。
 
-    2) 认证（DSH 0.2.x 起 /api 必须认证）
-       方式 A（本机，默认）：读取 DSH 数据目录下的 .credentials.yaml，
-         取 records["client-connection/browser-session"].payload.secret（HMAC 签名密钥，
-         32 字节 base64url），本地签发 authority 绑定的浏览器会话 Cookie：
-             Cookie 名  dsh-auth-<base64url(sha256(authority))>
-             Cookie 值  v1.<base64url(JSON payload)>.<base64url(HMAC-SHA256(secret, body))>
-             payload    {"version":1,"authority":"127.0.0.1:<port>",
-                         "issuedAt":<ms>,"expiresAt":<ms>}
-       方式 B（跨设备/无凭据文件）：把 `dsh web` 启动输出中带 ?token= 的完整 URL
-         填入 dsh_url（或把 token 填入 dsh_token），用
-             GET /connect?token=<token>&interactions=none
-         换取 API Cookie（v2）。DSH 端需 --trusted-host 放行该 authority。
+发现策略：
+    dsh_url（可含 ?token=）→ dsh_port → DSH_WEB_URL 环境变量 → 历史默认端口 59934
+    → 配置端口区间（默认 32768-65535，并兼容旧版默认区间）。先做 TCP 连通预筛，
+    再 GET / 做指纹识别：
+        401 + "dsh web authentication required" → 新版（需认证）
+        200 + 页面 DSH 标记                    → 旧版（无需认证）
+    端口发现结果缓存 cache_ttl_seconds，失败后自动重扫。
 
-    3) RPC
-       POST /api/<method>
-       请求  {"type":"client-request","rpcId":"<uuid>","method":"<name>","payload":{"args":{...}}}
-       响应  {"type":"server-response","rpcId":"<uuid>","result":{"ok":true,"value":{...}}}
-             失败时 {"ok":false,"error":{"code","message","details"}}
-
-       方法名使用斜杠命名（0.2.x），参数以命名参数对象传递：
-           session/create  {"request": {"cwd"?, "workspaceId"?, "sessionId"?, "agentPreset"?}}
-           session/list    {"_request": {}}
-           session/state   {"request": {"sessionId"}}
-           session/events  {"request": {"address": {"kind":"session","sessionId"},
-                                        "throughSeq"?, "beforeSeq"?, "maxMessages"?}}
-           session/prompt  {"request": {"requestId", "sessionId", "mode", "content": [...],
-                                        "clientTimeZone"}}
-           session/wait    {"request": {"sessionId", "afterSeq"?, "timeoutMs"?, "maxMessages"?}}
-           session/cancel  {"request": {"sessionId"}}
-
-    4) 完成判定
-       session/prompt 只表示消息已入队；用 session/wait 等待会话空闲/需要用户输入/超时。
-       session/wait 的 output.records 为倒序（最新在前）的 assistant/message 事件，
-       最终文本位于 event.data.message.content[] 中 type=="text" 的文本块。
-
-端口发现策略:
-    1. 配置了 dsh_url 时直接使用（可含 ?token=）；
-    2. 配置了 dsh_port > 0 时优先尝试该端口；
-    3. 尝试 DSH 历史默认端口 59934 与 DSH_WEB_URL 环境变量提示的地址；
-    4. 按配置的端口区间（默认 32768-65535）并发扫描，用 TCP 连通性预筛 + HTTP 指纹确认；
-    5. 对指纹命中的候选依次做认证校验（session/list），优先返回可用的那个。
-    结果缓存在内存中（cache_ttl_seconds），过期或失效后自动重扫。
-
-跨设备适配:
-    - 仅依赖 Python 标准库 + aiohttp（AstrBot 核心自带），Windows / Linux / macOS / Docker 通用；
-    - AstrBot 与 DSH 不在同一台机器时，用 dsh_url/dsh_token 方式认证，
-      同时 DSH 启动参数需加 --trusted-host 允许该来源地址；
-    - 扫描并发与超时均可配置，弱机/容器环境可调低。
+跨设备适配：
+    - 本机认证需要能读到 DSH 数据目录下的 .credentials.yaml；
+    - 跨设备认证使用 dsh_url/dsh_token；DSH Desktop 只监听 127.0.0.1，
+      跨设备需隧道/代理，或改用 `dsh web --host <局域网IP> --trusted-host <来源>`
+      的 CLI 实例。
 """
 
 from __future__ import annotations
@@ -71,7 +42,9 @@ import hmac
 import json
 import logging
 import os
+import platform
 import re
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -80,50 +53,50 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import aiohttp
 
-# DSH 历史默认监听端口（0.1.x 桌面壳；0.2.x Desktop 改为 --port 0 随机端口）
+# DSH 历史默认监听端口（0.1.x 桌面壳；0.2.x Desktop 改为随机临时端口）
 DSH_DEFAULT_PORT = 59934
-# 默认扫描区间：Windows 临时端口段 49152-65535 与 Linux/macOS 临时端口段 32768-60999 的并集
+# 新默认扫描区间：覆盖 Windows/Linux 临时端口段
 DEFAULT_PORT_RANGES = "32768-65535"
-# 指纹标记：未认证时 401 文本、认证后 HTML 标题与 boot 标记任一命中即视为 DSH
+# 1.0.0 时期保存下来的旧默认区间：读取时自动迁移，避免升级后旧配置漏扫高端口
+LEGACY_DEFAULT_PORT_RANGES = "59900-60100,49152-60000,32768-60999"
+# 指纹标记
 FINGERPRINT_TITLE = "DeepSeek Harness"
 FINGERPRINT_MARKER = "__DSH_BOOT__"
 AUTH_REQUIRED_MARKER = "dsh web authentication required"
 # 凭据文件中的浏览器会话签名密钥记录
 CREDENTIAL_RECORD = "client-connection/browser-session"
-# 自签 Cookie 的有效期：1 天（DSH 默认 cookieMaxAgeDays=30，且最小允许 1 天，取 1 天最稳）
+# 自签 Cookie 的有效期：1 天（DSH 允许的最小 cookieMaxAgeDays 也是 1 天）
 COOKIE_MAX_AGE_MS = 24 * 60 * 60 * 1000
-# session/wait 单次请求的等待窗口（秒）；到期后继续等待，直到整体超时
+# 新版 session/wait 单次等待窗口（秒）
 WAIT_SEGMENT_SECONDS = 20.0
-# 轮询兜底：判空后重试的最小/最大间隔（秒）
+# 旧版轮询兜底：判空后重试间隔（秒）
 IDLE_RETRY_MIN_SECONDS = 0.2
 IDLE_RETRY_MAX_SECONDS = 1.0
+# 协议标识
+PROTOCOL_MODERN = "modern"
+PROTOCOL_LEGACY = "legacy"
 
 
 def _b64url(data: bytes) -> str:
-    """标准库实现 base64url（无 padding），与 Node Buffer.toString("base64url") 对齐。"""
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
 def _b64url_decode(value: str) -> bytes:
-    """解码 base64url（容忍缺失 padding）。"""
     padding = "=" * ((4 - len(value) % 4) % 4)
     return base64.urlsafe_b64decode(value + padding)
 
 
 def _split_host_port(base_url: str) -> tuple[str, int | None, str]:
-    """拆出 (hostname, port, netloc)；hostname 为 WHATWG 形式（IPv6 不带方括号）。"""
     parts = urlsplit(base_url)
     host = (parts.hostname or "").strip().lower()
     try:
         port = parts.port
     except ValueError:
         port = None
-    netloc = parts.netloc.lower()
-    return host, port, netloc
+    return host, port, parts.netloc.lower()
 
 
 def _is_loopback_host(host: str) -> bool:
-    """判断主机名是否为回环地址（与 DSH 的 isLoopbackHostname 保持一致）。"""
     host = (host or "").strip().lower()
     if host in ("localhost", "::1"):
         return True
@@ -138,7 +111,7 @@ class DshError(Exception):
 
 
 class DshClient:
-    """DSH API 客户端：发现、认证、RPC 调用、投递任务并等待结果。"""
+    """DSH API 客户端：发现、认证、新旧协议 RPC、任务投递与结果等待。"""
 
     def __init__(
         self,
@@ -158,6 +131,10 @@ class DshClient:
         self._url_token: str | None = None
         self._release_version: str | None = None
         self._version_base: str | None = None
+        # 协议与候选指纹类型缓存
+        self._protocol: str | None = None
+        self._protocol_base: str | None = None
+        self._probe_kinds: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 配置
 
@@ -177,7 +154,10 @@ class DshClient:
 
     @property
     def port_ranges(self) -> list[tuple[int, int]]:
-        raw = str(self._cfg("port_ranges", DEFAULT_PORT_RANGES) or "")
+        raw = str(self._cfg("port_ranges", DEFAULT_PORT_RANGES) or "").strip()
+        # 升级迁移：1.0.0 保存的旧默认区间缺少 61000-65535
+        if raw == LEGACY_DEFAULT_PORT_RANGES:
+            raw = DEFAULT_PORT_RANGES
         ranges: list[tuple[int, int]] = []
         for part in raw.replace("，", ",").replace("；", ",").split(","):
             part = part.strip()
@@ -211,16 +191,16 @@ class DshClient:
     @property
     def scan_concurrency(self) -> int:
         try:
-            return max(8, min(1024, int(self._cfg("scan_concurrency", 512) or 512)))
+            return max(8, min(1024, int(self._cfg("scan_concurrency", 256) or 256)))
         except (TypeError, ValueError):
-            return 512
+            return 256
 
     @property
     def connect_timeout(self) -> float:
         try:
-            return max(0.05, min(2.0, float(self._cfg("port_probe_timeout_seconds", 0.3) or 0.3)))
+            return max(0.1, min(3.0, float(self._cfg("port_probe_timeout_seconds", 0.5) or 0.5)))
         except (TypeError, ValueError):
-            return 0.3
+            return 0.5
 
     @property
     def dsh_home(self) -> Path:
@@ -244,7 +224,6 @@ class DshClient:
         if raw:
             return raw
         if self._url_token is None:
-            # dsh_url 可能只在扫描时才被解析；这里主动解析一次以拿到 token
             self._explicit_base()
         return self._url_token
 
@@ -254,7 +233,7 @@ class DshClient:
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30, connect=5),
-                headers={"User-Agent": "astrbot-plugin-dsh-bridge/1.1"},
+                headers={"User-Agent": "astrbot-plugin-dsh-bridge/1.1.1"},
             )
         return self._http
 
@@ -319,10 +298,7 @@ class DshClient:
 
     @staticmethod
     def _extract_secret_text(text: str) -> str | None:
-        """从 .credentials.yaml 文本中提取浏览器会话签名密钥（base64url 文本）。
-
-        优先用 PyYAML（AstrBot 核心自带）；不可用时用缩进感知的简易解析兜底。
-        """
+        """从 .credentials.yaml 文本中提取浏览器会话签名密钥（base64url 文本）。"""
         try:
             import yaml  # type: ignore
 
@@ -331,7 +307,7 @@ class DshClient:
             secret = ((record or {}).get("payload") or {}).get("secret")
             if isinstance(secret, str) and secret.strip():
                 return secret.strip()
-        except Exception:  # noqa: BLE001 - YAML 不可用/格式异常时走兜底解析
+        except Exception:  # noqa: BLE001
             pass
 
         in_record = False
@@ -405,11 +381,7 @@ class DshClient:
         raise DshError("DSH 未返回认证 Cookie（令牌换取失败）。")
 
     async def _ensure_auth(self, base_url: str, force: bool = False) -> str:
-        """确保已获得 base_url 对应的认证 Cookie，返回 Cookie 请求头。
-
-        优先使用本机凭据文件（DSH 重启后仍有效）；不可用时回退到启动令牌。
-        收到 401 强制刷新时，优先换用另一种认证方式，避免一种凭据失效后无法自愈。
-        """
+        """确保已获得新版 DSH 的认证 Cookie；本机凭据优先，失败时换启动令牌。"""
         if not force and self._auth and self._auth.get("base") == base_url:
             return self._auth["cookie"]
 
@@ -466,7 +438,7 @@ class DshClient:
         )
 
     async def _release_version_of(self, base_url: str) -> str | None:
-        """认证后读取 DSH 版本（来自 index.html 的 __DSH_BOOT__.release.version）。"""
+        """新版 DSH 认证后读取版本（index.html 的 __DSH_BOOT__.release.version）。"""
         if self._version_base == base_url and self._release_version:
             return self._release_version
         try:
@@ -497,15 +469,32 @@ class DshClient:
         payload: dict | None = None,
         timeout: float = 30.0,
     ) -> Any:
-        """调用一个 DSH Remote 方法，返回 result.value（ok 时）。失败抛 DshError。
-
-        payload 为命名参数对象（等价于信封中的 payload.args），例如
-        session/create 传 {"request": {...}}，session/list 传 {"_request": {}}。
-        """
+        """按检测到的协议调用一个 DSH 方法（新版斜杠命名，旧版点号命名）。"""
         base = await self.discover()
-        return await self._rpc(base, method, payload or {}, timeout=timeout)
+        protocol = await self._ensure_protocol(base)
+        if protocol == PROTOCOL_LEGACY:
+            legacy_method = method.replace("/", ".")
+            legacy_payload = self._modern_args_to_legacy(payload or {})
+            return await self._legacy_rpc(base, legacy_method, legacy_payload, timeout)
+        return await self._modern_rpc(base, method, payload or {}, timeout)
 
-    async def _rpc(self, base_url: str, method: str, args: dict, timeout: float = 30.0) -> Any:
+    @staticmethod
+    def _modern_args_to_legacy(args: dict) -> dict:
+        if set(args.keys()) == {"_request"}:
+            return {}
+        if len(args) == 1 and "request" in args and isinstance(args["request"], dict):
+            return dict(args["request"])
+        return dict(args)
+
+    async def _modern_rpc(
+        self,
+        base_url: str,
+        method: str,
+        args: dict,
+        timeout: float = 30.0,
+        allow_unauth: bool = False,
+    ) -> Any:
+        """新版 RPC：斜杠方法名 + payload.args 命名参数 + Cookie 认证。"""
         body = {
             "type": "client-request",
             "rpcId": str(uuid.uuid4()),
@@ -515,28 +504,39 @@ class DshClient:
         session = await self._session()
         last_error: DshError | None = None
         for attempt in range(2):
-            cookie = await self._ensure_auth(base_url, force=attempt > 0)
+            cookie: str | None = None
+            auth_error: DshError | None = None
+            try:
+                cookie = await self._ensure_auth(base_url, force=attempt > 0)
+            except DshError as exc:
+                auth_error = exc
+                if not allow_unauth:
+                    raise
+            headers = {"Accept": "application/json"}
+            if cookie:
+                headers["Cookie"] = cookie
             try:
                 async with session.post(
                     f"{base_url}/api/{method}",
                     json=body,
-                    headers={"Cookie": cookie, "Accept": "application/json"},
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as resp:
                     if resp.status == 401:
-                        last_error = DshError(
+                        last_error = auth_error or DshError(
                             "DSH 拒绝了认证（HTTP 401）。"
                             "请确认 dsh_home 指向正在运行的 DSH 实例的数据目录，"
                             "或重新获取 `dsh web` 输出中的启动令牌。"
                         )
                         self._auth = None
-                        continue
+                        if cookie and attempt == 0:
+                            continue
+                        raise last_error
                     if resp.status == 403:
                         raise DshError(self._trust_hint())
                     if resp.status == 404:
                         raise DshError(
-                            f"DSH 不存在方法 {method}（HTTP 404）。本插件适配 DSH 0.2.2-rc.1+，"
-                            "请升级 DSH。"
+                            f"DSH 不存在方法 {method}（HTTP 404），可能是旧版本或未启用该能力"
                         )
                     if resp.status != 200:
                         detail = (await resp.text(errors="ignore"))[:200].strip()
@@ -558,11 +558,96 @@ class DshClient:
                 message = str(error.get("message") or error.get("msg") or code)
                 raise DshError(f"DSH 拒绝了 {method}（{code}）：{message}")
             value = result.get("value")
-            if value is None:
-                return {}
-            return value
-
+            return {} if value is None else value
         raise last_error or DshError(f"DSH 认证失败（{method}）")
+
+    async def _legacy_rpc(
+        self,
+        base_url: str,
+        method: str,
+        payload: dict | None = None,
+        timeout: float = 30.0,
+    ) -> Any:
+        """旧版 RPC：点号方法名 + 扁平 payload + 无认证。"""
+        body = {
+            "type": "client-request",
+            "rpcId": str(uuid.uuid4()),
+            "method": method,
+            "payload": payload or {},
+        }
+        session = await self._session()
+        try:
+            async with session.post(
+                f"{base_url}/api/{method}",
+                json=body,
+                headers={"Accept": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status == 401:
+                    raise DshError(
+                        "DSH 要求认证（旧协议接口返回 401）。"
+                        "请使用新版 DSH，或配置 dsh_url/dsh_token 后重试。"
+                    )
+                if resp.status == 403:
+                    raise DshError(self._trust_hint())
+                if resp.status == 404:
+                    raise DshError(f"旧版 DSH 不存在方法 {method}（HTTP 404）")
+                if resp.status != 200:
+                    detail = (await resp.text(errors="ignore"))[:200].strip()
+                    raise DshError(f"DSH API 返回 HTTP {resp.status}（{method}）：{detail}")
+                data = await resp.json(content_type=None)
+        except asyncio.TimeoutError as exc:
+            raise DshError(f"DSH API 调用超时（{method}）") from exc
+        except aiohttp.ClientError as exc:
+            raise DshError(f"无法连接 DSH（{method}）：{exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise DshError(f"DSH API 响应不是合法 JSON（{method}）") from exc
+
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict):
+            raise DshError(f"DSH API 响应格式异常（{method}）")
+        if not result.get("ok"):
+            code = result.get("code") or result.get("error") or "unknown"
+            message = result.get("message") or result.get("msg") or str(code)
+            raise DshError(f"DSH 拒绝了 {method}（{code}）：{message}")
+        value = result.get("value")
+        return {} if value is None else value
+
+    async def _ensure_protocol(self, base_url: str) -> str:
+        """检测 / 缓存当前 DSH 使用新版还是旧版协议。"""
+        if self._protocol and self._protocol_base == base_url:
+            return self._protocol
+
+        kind = self._probe_kinds.get(base_url)
+        if kind is None:
+            kind = await self._probe(base_url)
+
+        modern_ok = False
+        try:
+            await self._modern_rpc(
+                base_url, "session/list", {"_request": {}}, timeout=10, allow_unauth=True
+            )
+            modern_ok = True
+        except DshError:
+            modern_ok = False
+
+        if modern_ok:
+            protocol = PROTOCOL_MODERN
+        else:
+            legacy_ok = False
+            try:
+                await self._legacy_rpc(base_url, "session.list", {}, timeout=10)
+                legacy_ok = True
+            except DshError:
+                legacy_ok = False
+            protocol = PROTOCOL_LEGACY if legacy_ok or kind != "modern" else PROTOCOL_MODERN
+
+        self._protocol = protocol
+        self._protocol_base = base_url
+        self.logger.info(
+            f"[DSH Bridge] DSH 协议：{'旧版兼容模式' if protocol == PROTOCOL_LEGACY else '新版 0.2.x'}"
+        )
+        return protocol
 
     # -------------------------------------------------------------- 端口发现
 
@@ -575,72 +660,65 @@ class DshClient:
         async with self._discovery_lock:
             if not force and self._base_url and (time.monotonic() - self._discovered_at) < self.cache_ttl:
                 return self._base_url
-            # 快速路径：缓存仍新鲜但先做一次廉价活性 + 认证校验
-            if self._base_url and await self._probe_url(self._base_url) and await self._verify(self._base_url):
-                self._discovered_at = time.monotonic()
-                return self._base_url
+            # 缓存仍有效：只要指纹还在就算可用（不因认证失败丢弃缓存）
+            if self._base_url:
+                kind = await self._probe(self._base_url)
+                if kind:
+                    self._probe_kinds[self._base_url] = kind
+                    self._discovered_at = time.monotonic()
+                    return self._base_url
             self._base_url = None
             self._auth = None
+            self._protocol = None
+            self._protocol_base = None
             found = await self._scan(progress=progress)
             if found is None:
                 raise DshError(self._not_found_hint())
             self._base_url = found
             self._discovered_at = time.monotonic()
-            self.logger.info(f"[DSH Bridge] 已发现 DSH: {found}（认证方式：{(self._auth or {}).get('mode')}）")
+            self.logger.info(
+                f"[DSH Bridge] 已发现 DSH: {found}"
+                f"（指纹：{self._probe_kinds.get(found, 'unknown')}）"
+            )
             return found
 
     def _not_found_hint(self) -> str:
+        raw_ranges = str(self._cfg("port_ranges", DEFAULT_PORT_RANGES) or "默认")
         hint = (
-            "未能在本机发现 DeepSeek Harness。请确认："
+            f"未能在本机发现 DeepSeek Harness（“本机”指运行 AstrBot 的机器："
+            f"{platform.node()} / {sys.platform}）。请确认："
             "1) DSH Desktop / dsh web 正在运行；"
-            "2) 若 DSH 端口不确定，可把 DSH 窗口地址栏或 `dsh web` 输出里的完整 URL"
-            "（形如 http://127.0.0.1:<端口>/?token=...）填入插件配置 dsh_url，这样无需扫描；"
-            "3) AstrBot 与 DSH 不在同一台设备时，把 dsh_host 配为 DSH 所在设备的局域网 IP，"
-            "并配置 dsh_token / dsh_url 与 DSH 的 --trusted-host。"
+            f"2) 当前配置：dsh_host={self.host}，dsh_port={self.port_override}，"
+            f"dsh_url={self._cfg('dsh_url', '') or '（空）'}，"
+            f"扫描区间={raw_ranges}，DSH数据目录={self.dsh_home}；"
+            "3) 不确定端口时，把 DSH 窗口地址栏或 `dsh web` 输出里的完整 URL"
+            "（形如 http://127.0.0.1:<端口>/?token=...）填入 dsh_url；"
+            "4) DSH Desktop 0.2.x 只监听 127.0.0.1，若 AstrBot 与 DSH 不在同一台机器，"
+            "需要 SSH 隧道/反向代理，或改用 `dsh web --host <局域网IP> --trusted-host <来源>`。"
         )
-        if self.host != "127.0.0.1":
-            hint = f"无法通过 {self.host} 连接 DSH。" + hint
         return hint
 
-    async def _probe_url(self, base_url: str) -> bool:
-        """未认证指纹探测：401 认证提示文本，或 200 页面中的 DSH 标记。"""
+    async def _probe(self, base_url: str) -> str | None:
+        """指纹探测：返回 'modern'（401 认证提示）/ 'legacy'（200 页面标记）/ None。"""
         try:
             session = await self._session()
             async with session.get(
                 base_url + "/",
-                allow_redirects=False,
-                timeout=aiohttp.ClientTimeout(total=1.5),
+                timeout=aiohttp.ClientTimeout(total=2.5),
             ) as resp:
                 if resp.status == 401:
-                    text = (await resp.text(errors="ignore"))[:2000]
-                    return AUTH_REQUIRED_MARKER in text
+                    text = (await resp.text(errors="ignore"))[:4000]
+                    if AUTH_REQUIRED_MARKER in text:
+                        return "modern"
+                    return None
                 if resp.status != 200:
-                    return False
+                    return None
                 head = (await resp.text(errors="ignore"))[:20000]
-                return FINGERPRINT_TITLE in head or FINGERPRINT_MARKER in head
+                if FINGERPRINT_TITLE in head or FINGERPRINT_MARKER in head:
+                    return "legacy"
+                return None
         except Exception:
-            return False
-
-    async def _verify(self, base_url: str) -> bool:
-        """认证校验：能成功调用 session/list 才认为该地址可用。"""
-        if not self._auth_available(base_url):
-            return False
-        try:
-            await self._rpc(base_url, "session/list", {"_request": {}}, timeout=10)
-            return True
-        except DshError as exc:
-            self.logger.debug(f"[DSH Bridge] 候选地址认证校验失败 {base_url}: {exc}")
-            return False
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _auth_available(self, base_url: str) -> bool:
-        """是否具备可尝试的认证材料（本机凭据文件或启动令牌）。"""
-        _host, _port, _netloc = _split_host_port(base_url)
-        local = _is_loopback_host(_host or self.host)
-        if local and self._load_secret() is not None:
-            return True
-        return self.token is not None
+            return None
 
     async def _port_open(self, port: int) -> bool:
         try:
@@ -683,18 +761,15 @@ class DshClient:
     async def _scan(
         self, progress: Callable[[str], Awaitable[None]] | None = None
     ) -> str | None:
-        """扫描候选地址并认证校验，返回首个可用基地址。"""
+        """扫描候选地址，返回首个指纹命中的基地址（新旧版都接受）。"""
         explicit = self._explicit_base()
-        # 显式地址是用户指定的权威入口：能连通就是它，认证问题留给调用方明确报错，
-        # 不再花时间扫描其他端口。
         if explicit:
-            if await self._probe_url(explicit):
-                if self._auth_available(explicit):
-                    await self._verify(explicit)
+            kind = await self._probe(explicit)
+            if kind:
+                self._probe_kinds[explicit] = kind
                 return explicit
 
         ordered: list[tuple[int | None, str]] = []
-        # DSH_WEB_URL 环境变量作为提示候选（仅当显式 URL 未配置时）
         if not explicit:
             env_url = os.environ.get("DSH_WEB_URL", "").strip()
             if env_url:
@@ -709,38 +784,15 @@ class DshClient:
                 f"🔍 开始扫描 {self.host}（共 {len(ordered)} 个候选端口，优先显式地址/默认端口）…"
             )
 
-        fallback: str | None = None
-        fallback_lock = asyncio.Lock()
-
-        async def consider(base: str) -> str | None:
-            nonlocal fallback
-            if not await self._probe_url(base):
-                return None
-            # 没有任何认证材料时无法做认证校验，指纹命中即可返回，
-            # 让后续调用给出明确的「如何配置认证」提示。
-            if not self._auth_available(base):
-                self.logger.warning(
-                    f"[DSH Bridge] 在 {base} 发现疑似 DSH，但未找到认证材料（凭据文件/启动令牌），"
-                    "调用时可能返回认证失败提示。"
-                )
-                return base
-            if await self._verify(base):
-                return base
-            async with fallback_lock:
-                if fallback is None:
-                    fallback = base
-                    self.logger.warning(
-                        f"[DSH Bridge] {base} 疑似 DSH，但认证校验未通过，继续扫描其他端口。"
-                    )
-            return None
-
         async def try_candidate(port: int | None, base: str) -> str | None:
-            # 端口候选先做 TCP 连通预筛，避免对未开放端口发出 HTTP 请求白等超时
             if port is not None and not await self._port_open(port):
                 return None
-            return await consider(base)
+            kind = await self._probe(base)
+            if kind:
+                self._probe_kinds[base] = kind
+                return base
+            return None
 
-        # 1) 显式地址与高优先级端口：并发直探
         priority = ordered[:8]
         if priority:
             results = await asyncio.gather(
@@ -750,7 +802,6 @@ class DshClient:
                 if base is not None:
                     return base
 
-        # 2) 其余端口：TCP 预筛 + HTTP 指纹 + 认证校验（分批并发）
         rest = ordered[8:]
         total = len(rest)
         sem = asyncio.Semaphore(self.scan_concurrency)
@@ -770,28 +821,51 @@ class DshClient:
             scanned += len(batch)
             if progress and index % 4 == 0:
                 await progress(f"🔍 扫描中… 已检查 {scanned}/{total} 个端口")
-
-        if fallback is not None:
-            return fallback
         return None
 
     # -------------------------------------------------------------- 会话操作
 
     async def ping(self) -> dict:
-        """连通性 + 会话概览 + DSH 版本。认证失败会直接抛出 DshError。"""
+        """连通性 + 协议 + 会话概览。发现成功即视为已连接（API 失败只记警告）。"""
         base = await self.discover()
-        value = await self.call("session/list", {"_request": {}}, timeout=15)
-        items = value.get("items") if isinstance(value, dict) else None
-        items = items or []
+        protocol = await self._ensure_protocol(base)
         info: dict[str, Any] = {
             "base": base,
-            "auth": (self._auth or {}).get("mode"),
-            "sessions": len(items),
-            "running": len([s for s in items if s.get("running")]),
+            "protocol": protocol,
+            "auth": (self._auth or {}).get("mode") or ("none" if protocol == PROTOCOL_LEGACY else None),
         }
-        version = await self._release_version_of(base)
-        if version:
-            info["version"] = version
+        if protocol == PROTOCOL_LEGACY:
+            try:
+                value = await self._legacy_rpc(base, "session.list", {}, timeout=15)
+                items = value.get("items") if isinstance(value, dict) else None
+                items = items or []
+                info["sessions"] = len(items)
+                info["running"] = len([s for s in items if s.get("running")])
+            except DshError as exc:
+                info["sessions_error"] = str(exc)
+            try:
+                desc = await self._legacy_rpc(base, "host.describe", {}, timeout=10)
+                if isinstance(desc, dict):
+                    info["host"] = desc
+                    version = desc.get("version")
+                    if version:
+                        info["version"] = str(version)
+            except DshError:
+                pass
+        else:
+            try:
+                value = await self._modern_rpc(
+                    base, "session/list", {"_request": {}}, timeout=15
+                )
+                items = value.get("items") if isinstance(value, dict) else None
+                items = items or []
+                info["sessions"] = len(items)
+                info["running"] = len([s for s in items if s.get("running")])
+            except DshError as exc:
+                info["sessions_error"] = str(exc)
+            version = await self._release_version_of(base)
+            if version:
+                info["version"] = version
         return info
 
     async def run_prompt(
@@ -804,34 +878,63 @@ class DshClient:
         max_result_chars: int = 6000,
         progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
-        """向 DSH 投递一条 prompt，等待 agent 完成后返回最终回复。
+        """投递 prompt 并等待 DSH 智能体完成，返回最终回复。"""
+        base = await self.discover()
+        protocol = await self._ensure_protocol(base)
+        if protocol == PROTOCOL_LEGACY:
+            return await self._run_prompt_legacy(
+                base,
+                prompt,
+                cwd=cwd,
+                session_id=session_id,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                max_result_chars=max_result_chars,
+                progress=progress,
+            )
+        return await self._run_prompt_modern(
+            base,
+            prompt,
+            cwd=cwd,
+            session_id=session_id,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_result_chars=max_result_chars,
+            progress=progress,
+        )
 
-        返回 {"text", "sessionId", "duration_ms", "waits", "truncated",
-              "pending_input", "reason"}；超时/失败抛 DshError。
-        """
+    async def _run_prompt_modern(
+        self,
+        base: str,
+        prompt: str,
+        cwd: str | None = None,
+        session_id: str | None = None,
+        timeout: float = 900.0,
+        poll_interval: float = 2.0,
+        max_result_chars: int = 6000,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict:
         start = time.monotonic()
-        await self.discover()
-
-        # 1. 确定会话
         own_session = session_id is None
         if own_session:
             create_args: dict[str, Any] = {}
             if cwd:
                 create_args["cwd"] = cwd
-            created = await self.call("session/create", {"request": create_args}, timeout=60)
+            created = await self._modern_rpc(
+                base, "session/create", {"request": create_args}, timeout=60
+            )
             session_id = (created or {}).get("sessionId") if isinstance(created, dict) else None
             if not session_id:
                 raise DshError("DSH 未返回会话 ID")
         if progress:
             await progress(f"📡 已接入 DSH 会话 {session_id}，任务已投递，等待 DSH 智能体执行…")
 
-        # 2. 记录投递前的会话游标，作为等待输出的下界
-        baseline = await self._session_cursor(session_id)
+        baseline = await self._session_cursor(base, session_id)
 
-        # 3. 投递 prompt
         request_id = str(uuid.uuid4())
         try:
-            await self.call(
+            await self._modern_rpc(
+                base,
                 "session/prompt",
                 {
                     "request": {
@@ -849,7 +952,6 @@ class DshClient:
                 await self._safe_cancel(session_id)
             raise
 
-        # 4. 等待完成：session/wait 阻塞直到空闲 / 需要用户输入 / 分段超时
         deadline = start + timeout
         records: list[dict] = []
         reason: str | None = None
@@ -857,7 +959,6 @@ class DshClient:
         waits = 0
         pending_input = False
         retry_sleep = max(IDLE_RETRY_MIN_SECONDS, min(IDLE_RETRY_MAX_SECONDS, poll_interval / 2))
-        # 任务迟迟不开始（游标不前进且不运行）时，超过该时限直接报错，避免空转到整体超时
         stalled_since = time.monotonic()
         stall_limit = 120.0
         try:
@@ -868,7 +969,8 @@ class DshClient:
                 segment_ms = int(max(1.0, min(WAIT_SEGMENT_SECONDS, remaining)) * 1000)
                 waits += 1
                 try:
-                    value = await self.call(
+                    value = await self._modern_rpc(
+                        base,
                         "session/wait",
                         {
                             "request": {
@@ -899,7 +1001,6 @@ class DshClient:
                 if reason == "idle":
                     if records:
                         break
-                    # 防抖：任务可能尚未真正开始（会话被误判为空闲）
                     if self._queue_has(state, request_id) or cursor <= baseline:
                         if time.monotonic() - stalled_since > stall_limit:
                             await self._safe_cancel(session_id)
@@ -913,13 +1014,11 @@ class DshClient:
                 if reason == "input-required":
                     pending_input = True
                     break
-                # reason == "timeout" 或其他：继续下一段等待，直到整体超时
         except asyncio.CancelledError:
             await self._safe_cancel(session_id)
             raise
 
         duration_ms = int((time.monotonic() - start) * 1000)
-
         if pending_input:
             text = self._collect_assistant_text(records)
             note = "（DSH 正在等待用户确认或回答，请到 DSH 窗口处理后重试。）"
@@ -933,7 +1032,6 @@ class DshClient:
                 "pending_input": True,
                 "reason": reason,
             }
-
         if reason != "idle":
             await self._safe_cancel(session_id)
             raise DshError(
@@ -957,16 +1055,127 @@ class DshClient:
             "reason": reason,
         }
 
-    async def _session_cursor(self, session_id: str) -> int:
-        """读取会话当前事件游标。"""
-        value = await self.call("session/state", {"request": {"sessionId": session_id}}, timeout=30)
+    async def _run_prompt_legacy(
+        self,
+        base: str,
+        prompt: str,
+        cwd: str | None = None,
+        session_id: str | None = None,
+        timeout: float = 900.0,
+        poll_interval: float = 2.0,
+        max_result_chars: int = 6000,
+        progress: Callable[[str], Awaitable[None]] | None = None,
+    ) -> dict:
+        """旧版 DSH：点号方法 + session.history 轮询到 turn/end。"""
+        start = time.monotonic()
+        own_session = session_id is None
+        if own_session:
+            create_payload: dict[str, Any] = {}
+            if cwd:
+                create_payload["cwd"] = cwd
+            created = await self._legacy_rpc(base, "session.create", create_payload, timeout=60)
+            session_id = (created or {}).get("sessionId") if isinstance(created, dict) else None
+            if not session_id:
+                raise DshError("DSH 未返回会话 ID")
+        if progress:
+            await progress(f"📡 已接入 DSH 会话 {session_id}，任务已投递，等待 DSH 智能体执行…")
+
+        try:
+            await self._legacy_rpc(
+                base,
+                "session.prompt",
+                {
+                    "sessionId": session_id,
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": prompt}],
+                    "clientTimeZone": self._tz_name(),
+                },
+                timeout=60,
+            )
+        except DshError:
+            if own_session:
+                await self._safe_cancel(session_id)
+            raise
+
+        deadline = start + timeout
+        texts: list[str] = []
+        done = False
+        polls = 0
+        try:
+            while time.monotonic() < deadline:
+                await asyncio.sleep(max(1.0, poll_interval))
+                polls += 1
+                history = await self._legacy_rpc(
+                    base,
+                    "session.history",
+                    {"sessionId": session_id, "maxMessages": 300},
+                    timeout=30,
+                )
+                events = history.get("events") if isinstance(history, dict) else None
+                texts, done = self._extract_legacy_history(events or [], texts)
+                if done and texts:
+                    break
+        except asyncio.CancelledError:
+            await self._safe_cancel(session_id)
+            raise
+        except DshError:
+            if own_session:
+                await self._safe_cancel(session_id)
+            raise
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+        if not done:
+            await self._safe_cancel(session_id)
+            raise DshError(
+                f"DSH 智能体在 {int(timeout)} 秒内未完成任务（会话 {session_id} 已发送取消）。"
+                "可尝试在插件配置中调大 request_timeout_seconds。"
+            )
+        text = "\n\n".join(t for t in texts if t).strip()
+        truncated = False
+        if max_result_chars > 0 and len(text) > max_result_chars:
+            text = text[:max_result_chars] + "\n…(结果过长已截断)"
+            truncated = True
+        if not text:
+            text = "（DSH 智能体未返回可见文本）"
+        return {
+            "text": text,
+            "sessionId": session_id,
+            "duration_ms": duration_ms,
+            "waits": polls,
+            "truncated": truncated,
+            "pending_input": False,
+            "reason": "turn-end",
+        }
+
+    @staticmethod
+    def _extract_legacy_history(events: list, texts: list[str]) -> tuple[list[str], bool]:
+        """从旧版 session.history 事件列表提取 assistant 文本与 turn/end 标记。"""
+        done = False
+        for entry in events:
+            if not isinstance(entry, dict):
+                continue
+            event = entry.get("event") or entry
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("type") or ""
+            if event_type == "assistant/message":
+                text = DshClient._extract_text(event.get("data") or {})
+                if text and (not texts or texts[-1] != text):
+                    texts.append(text)
+            elif event_type == "turn/end":
+                done = True
+        return texts, done
+
+    async def _session_cursor(self, base: str, session_id: str) -> int:
+        value = await self._modern_rpc(
+            base, "session/state", {"request": {"sessionId": session_id}}, timeout=30
+        )
         if isinstance(value, dict) and isinstance(value.get("cursor"), int):
             return int(value["cursor"])
         return -1
 
     @staticmethod
     def _queue_has(state: dict, request_id: str) -> bool:
-        """判断 prompt 是否仍停留在会话队列中（尚未被处理）。"""
         for item in state.get("queue") or []:
             if isinstance(item, dict) and item.get("rpcId") == request_id:
                 return True
@@ -974,7 +1183,6 @@ class DshClient:
 
     @staticmethod
     def _extract_text(data: dict) -> str:
-        """从 assistant/message 事件的 data 中提取文本块。"""
         message = data.get("message") or {}
         content = message.get("content")
         if isinstance(content, str):
@@ -989,7 +1197,6 @@ class DshClient:
 
     @classmethod
     def _collect_assistant_text(cls, records: list[dict]) -> str:
-        """从 session/wait 返回的记录（倒序，最新在前）中按时间顺序拼接文本。"""
         texts: list[str] = []
         for entry in reversed(records or []):
             if not isinstance(entry, dict):
@@ -1004,11 +1211,6 @@ class DshClient:
 
     @staticmethod
     def _tz_name() -> str:
-        """返回 IANA 时区名（DSH 只接受 UTC 或 IANA Area/Location 名）。
-
-        优先取系统本地时区的 tzinfo.key（ZoneInfo 提供 IANA 名），
-        不可用时回退到 UTC，避免把「中国标准时间」这类本地化名称发给 DSH。
-        """
         try:
             import datetime
 
@@ -1022,7 +1224,19 @@ class DshClient:
 
     async def _safe_cancel(self, session_id: str) -> None:
         try:
-            await self.call("session/cancel", {"request": {"sessionId": session_id}}, timeout=10)
+            base = await self.discover()
+            protocol = await self._ensure_protocol(base)
+            if protocol == PROTOCOL_LEGACY:
+                await self._legacy_rpc(
+                    base, "session.cancel", {"sessionId": session_id}, timeout=10
+                )
+            else:
+                await self._modern_rpc(
+                    base,
+                    "session/cancel",
+                    {"request": {"sessionId": session_id}},
+                    timeout=10,
+                )
         except Exception as exc:  # noqa: BLE001 - 取消失败不影响主流程
             self.logger.warning(f"[DSH Bridge] 取消会话失败: {exc}")
 
@@ -1037,8 +1251,9 @@ class DshClient:
     async def _warm(self) -> None:
         try:
             await asyncio.sleep(1.0)
-            await self.discover()
+            base = await self.discover()
+            await self._ensure_protocol(base)
         except DshError as exc:
-            self.logger.info(f"[DSH Bridge] 后台预热未发现 DSH（首次使用时将重新扫描）：{exc}")
+            self.logger.warning(f"[DSH Bridge] 后台预热未发现 DSH：{exc}")
         except Exception as exc:  # noqa: BLE001
             self.logger.warning(f"[DSH Bridge] 后台预热异常: {exc}")

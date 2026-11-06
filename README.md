@@ -1,11 +1,11 @@
 # AstrBot Plugin: DSH Bridge
 
-让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**（适配 **DSH 0.2.2-rc.1+**）：
+让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**（同时兼容 **DSH 0.2.2-rc.1+ 新版**与**旧版无认证 DSH**）：
 
 - AstrBot 主智能体获得两个函数工具 —— `dsh_ask`（把任务投递给 DSH 智能体并取回最终回复）和 `dsh_ping`（连通性检测）；
 - 插件通过 `on_llm_request` 钩子向主智能体的系统提示词**自动注入使用说明**（可开关、可自定义）；
 - 自动**扫描回环端口**发现 DSH Web 服务（DSH 0.2.x Desktop 使用随机临时端口，默认扫描 `32768-65535`），也可用 `dsh_url` 直接固定地址；
-- 自动完成 **DSH 0.2.x 的 API 认证**：默认读取 DSH 数据目录下的凭据文件自签浏览器会话 Cookie；跨设备场景可用 `dsh web` 启动 URL 的 `?token=`；
+- **自动识别协议**：新版 DSH 走 Cookie 认证 + `session/*` 斜杠接口 + `session/wait`；旧版走无认证的点号接口 + `session.history` 轮询；
 - 适配不同设备：Windows / Linux / macOS / Docker 通用。
 
 ```
@@ -15,16 +15,18 @@
 └──────────────┘   prompt 注入       └──────────────────────┘   session/* 接口            └──────────────────────┘
 ```
 
-> **兼容性说明**：DSH 0.2.x 起把本地 API 从「无鉴权」改为「必须浏览器会话认证」，并把 RPC 方法名从 `session.create` 这类点号命名改为 `session/create` 斜杠命名、参数改为命名参数、完成判定改为 `session/wait` 事件等待。本插件 1.1.0 已按 **DSH 0.2.2-rc.1** 的接口重写；1.0.0 只适用于更早的无鉴权 DSH。
+> **兼容性说明**：DSH 0.2.x 起把本地 API 从「无鉴权」改为「必须浏览器会话认证」，并把 RPC 方法名从 `session.create` 这类点号命名改为 `session/create` 斜杠命名、参数改为命名参数、完成判定改为 `session/wait` 事件等待。插件 1.1.1 会**自动识别新旧协议**：新版走认证 + 斜杠接口，旧版走无认证 + 点号接口，两种环境都能正常使用。
+>
+> 历史版本注意：1.1.0 只支持新版 DSH（旧版环境会出现「基础检测也失效」），1.0.0 只支持旧版；请使用 1.1.1。
 
 ---
 
 ## 一、环境要求
 
 - **AstrBot ≥ 4.16**（本插件基于 AstrBot 4.26 规范开发，`astrbot_version: ">=4.16.0"`）
-- **DeepSeek Harness 0.2.2-rc.1 或更新版本** 正在运行（DSH Desktop 桌面版，或 `dsh web` 命令行版）
+- **DeepSeek Harness** 正在运行（DSH Desktop 桌面版，或 `dsh web` 命令行版；新版/旧版均可）
 - 插件只用 Python 标准库 + `aiohttp`（AstrBot 核心自带）；读取 YAML 凭据时优先用 PyYAML，缺失时自动降级为内置解析
-- **本机认证方式要求 AstrBot 与 DSH 以同一操作系统用户运行**（插件需要读取 DSH 数据目录下的 `.credentials.yaml`）
+- **新版 DSH 的本机认证方式要求 AstrBot 与 DSH 以同一操作系统用户运行**（插件需要读取 DSH 数据目录下的 `.credentials.yaml`）；旧版 DSH 无需认证
 
 ## 二、安装
 
@@ -53,9 +55,9 @@ cd data/plugins
 git clone https://github.com/SilverIceKey/astrbot_plugin_dsh_bridge.git
 ```
 
-## 三、认证说明（DSH 0.2.x 必读）
+## 三、认证说明（仅新版 DSH 需要）
 
-DSH 0.2.x 的 Web/API 需要认证，本插件按以下顺序自动选择：
+插件会自动识别 DSH 版本：旧版（无认证、点号接口）直接使用兼容模式；新版（0.2.x）按以下顺序完成认证：
 
 1. **本机凭据文件（默认，推荐）**
    插件读取 DSH 数据目录下的 `.credentials.yaml`，取
@@ -84,9 +86,9 @@ DSH 0.2.x 的 Web/API 需要认证，本插件按以下顺序自动选择：
 | `dsh_host` | `127.0.0.1` | DSH 所在主机；跨设备时填局域网 IP |
 | `dsh_url` | 空 | 直接指定 DSH 地址（可带 `?token=`），跳过扫描；**最省事的固定方式** |
 | `dsh_port` | `0` | 手动指定 DSH 端口；`0` = 自动扫描 |
-| `port_ranges` | `32768-65535` | 自动扫描区间（覆盖 Windows/Linux 临时端口段） |
-| `scan_concurrency` | `512` | 扫描并发，弱机调低（如 64） |
-| `port_probe_timeout_seconds` | `0.3` | 单端口 TCP 探测超时 |
+| `port_ranges` | `32768-65535` | 自动扫描区间（覆盖 Windows/Linux 临时端口段；1.0.0 旧默认会自动迁移） |
+| `scan_concurrency` | `256` | 扫描并发，弱机调低（如 64） |
+| `port_probe_timeout_seconds` | `0.5` | 单端口 TCP 探测超时（太小会漏检） |
 | `cache_ttl_seconds` | `300` | 端口发现结果缓存时长 |
 | `dsh_home` | 空 | DSH 数据目录（含 `.credentials.yaml`），留空用 `DSH_HOME` 或 `~/.dsh` |
 | `dsh_token` | 空 | `dsh web` 启动 URL 中的 token（跨设备/无凭据文件时使用） |
@@ -144,35 +146,37 @@ DSH 默认权限预设会在执行写文件、跑命令等操作前**请求用�
 
 1. **端口发现**：DSH 0.2.x Desktop 以 `--port 0` 启动，Web 端口是系统随机临时端口。
    插件先尝试 `dsh_url` / `dsh_port` / `DSH_WEB_URL` / 历史默认端口 `59934`，再按 `32768-65535`
-   并发扫描：对每个端口先做 TCP 连通预筛，再 `GET /` 检查指纹——
-   未认证时 DSH 返回 401 文本 `dsh web authentication required; ...`；
-   认证后返回含 `DeepSeek Harness` / `__DSH_BOOT__` 的 index.html（还能读到 `release.version`）。
-   指纹命中后，再用 `session/list` 做一次认证校验，确保选中的是真正可用的 DSH。
-2. **认证**：见第三节。本机默认用 `.credentials.yaml` 中的 `browser-session` 签名密钥
+   并发扫描：对每个端口先做 TCP 连通预筛，再 `GET /` 检查指纹（自动跟随重定向）——
+   新版 DSH 未认证时返回 401 文本 `dsh web authentication required; ...`；
+   旧版 DSH 直接返回含 `DeepSeek Harness` / `__DSH_BOOT__` 的 index.html。
+   指纹命中即返回，不因认证失败而丢弃候选（恢复 1.0.0 的容错行为）。
+2. **协议识别**：先用新版的 `session/list` 探测一次；成功即新版，失败且旧版 `session.list` 成功即旧版。
+   `dsh_ping` / `dsh_status` 会显示当前是「新版 0.2.x」还是「旧版兼容模式」。
+3. **认证（仅新版）**：本机默认用 `.credentials.yaml` 中的 `browser-session` 签名密钥
    （32 字节 base64url）签发 `dsh-auth-<authority 哈希>` Cookie：
    `v1.<payload>.<HMAC-SHA256>`，payload 含 `authority` / `issuedAt` / `expiresAt`。
-3. **调用**：向 DSH 的 `/api/<method>` 发送 JSON 信封
-   `{"type":"client-request","rpcId":"<uuid>","method":"...","payload":{"args":{...}}}`：
-   - `session/create` → 新建会话（默认每次任务一个独立会话）
-   - `session/state` → 读取投递前的事件游标
-   - `session/prompt` → 投递任务（`mode: "queue"`，带客户端生成的 `requestId`）
-   - `session/wait` → 阻塞等待会话空闲，`output.records` 中取 `assistant/message` 的文本块
-   - 超时 → `session/cancel` 取消并报错；需要用户审批 → 返回「等待确认」并保留任务
-4. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
+4. **调用**：
+   - 新版：向 `/api/<method>` 发送 `{"type":"client-request",...,"payload":{"args":{...}}}`，
+     流程 `session/create` → `session/state` → `session/prompt` → `session/wait`
+     （超时 `session/cancel`）；
+   - 旧版：发送扁平的 `payload`，流程 `session.create` → `session.prompt` →
+     轮询 `session.history` 直到 `turn/end`（超时 `session.cancel`）。
+5. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
 
 ## 七、常见问题
 
 | 现象 | 处理 |
 | --- | --- |
-| `/dsh ping` 提示未发现 DSH | 1) 确认 DSH Desktop 已打开；2) 把 DSH 窗口地址栏的完整 URL（含 `?token=`）填入 `dsh_url` 最省事；3) 或执行 `/dsh scan` 强制重扫 |
+| `/dsh ping` 提示未发现 DSH | 1) 确认 DSH Desktop 已打开；2) 把 DSH 窗口地址栏的完整 URL（含 `?token=`）填入 `dsh_url` 最省事；3) 或执行 `/dsh scan` 强制重扫；4) 看提示里的「本机」信息，确认 AstrBot 确实和 DSH 在同一台机器 |
+| `/dsh ping` 显示已连接但提示会话查询失败 | 说明发现成功、只是 API 权限/认证没通；看提示里的认证方式与错误。旧版会显示「旧版无需认证」，新版需 `dsh_home` 可读或 `dsh_token` 有效 |
 | 401 / 「DSH 要求认证」 | 本机：确认 `dsh_home` 指向 DSH 数据目录（默认 `~/.dsh`），且 AstrBot 与 DSH 同用户；跨设备：配置 `dsh_url`/`dsh_token` |
 | 403 / 「来源地址不在信任列表」 | 跨设备访问需给 DSH 加 `--trusted-host <本插件访问用的 host:port>` 并重启 |
-| 扫描很慢 | DSH 端口是随机的，全量扫描约 10-20 秒；确定端口后填 `dsh_url` 或 `dsh_port` 可秒连 |
+| 扫描很慢 | DSH 端口是随机的，全量扫描约 20-40 秒（默认 256 并发）；确定端口后填 `dsh_url` 或 `dsh_port` 可秒连 |
 | 任务一直「等待用户确认」 | 到 DSH 窗口处理审批；或调整 DSH 默认权限预设 |
 | 任务超时被取消 | 调大 `request_timeout_seconds`；长任务建议拆分成小任务 |
 | 返回内容过长 | 调大 `max_result_chars`（注意上下文占用） |
 | 工具报 `session/not-found` 等错误 | 多为会话已关闭/被归档，切回 `session_mode: new` 或更换会话 ID |
-| 提示方法 404 | DSH 版本过旧，请升级到 0.2.2-rc.1+ |
+| 提示方法 404 | 该实例没有对应接口（版本过旧或能力未启用）；插件会自动尝试旧版兼容模式，若仍失败请升级 DSH |
 
 ## 八、安全说明
 
@@ -198,7 +202,13 @@ astrbot_plugin_dsh_bridge/
 
 ## 十、Changelog
 
-- **1.1.0** 适配 DSH 0.2.2-rc.1+：
+- **1.1.1** 回归修复 + 双协议兼容：
+  - 恢复对**旧版 DSH** 的支持：自动识别新版（Cookie 认证 + `session/*` + `session/wait`）与旧版（无认证 + 点号方法 + `session.history` 轮询），`/dsh ask` 在新旧两种 DSH 上都能创建会话并取回结果；
+  - `dsh_ping` 恢复容错：只要端口指纹发现成功就显示「已连接」，API 认证/查询失败只作为警告，不再把基础检测判死；
+  - 指纹探测恢复跟随 HTTP 重定向，放宽探测超时（TCP 0.5s / HTTP 2.5s），并自动迁移 1.0.0 保存的旧端口区间（避免漏扫 61000-65535）；
+  - 失败提示会带上 AstrBot 所在机器、`dsh_host`/`dsh_port`/`dsh_url`/扫描区间/DSH 数据目录，便于定位是跨机器还是端口问题；
+  - 新增旧版协议的本地 mock 集成测试（含重定向、ping、`dsh_ask` 轮询）。
+- **1.1.0** 适配 DSH 0.2.2-rc.1（仅新版）：
   - 新增 DSH 0.2.x API 认证（本机 `.credentials.yaml` 自签浏览器 Cookie / `dsh web` 启动令牌换取 API Cookie）；
   - RPC 改为 `session/create`、`session/prompt`、`session/state`、`session/wait` 等斜杠方法名与命名参数信封；
   - 完成判定改用 `session/wait` 事件等待，去掉高频轮询；`session/wait` 报告 `input-required` 时保留任务并提示审批；

@@ -11,9 +11,11 @@
     4. 管理员命令: /dsh ping / /dsh scan / /dsh ask <任务> / /dsh session <id> <任务>
        / /dsh status / /dsh help。
 
-适配性（DSH 0.2.2-rc.1+）:
-    - DSH 0.2.x 起本地 API 需要浏览器会话认证：本插件默认读取 DSH 数据目录下的
-      `.credentials.yaml` 签名密钥自签 Cookie；跨设备时可用 dsh_url/dsh_token 的启动令牌；
+适配性（DSH 0.2.2+ 与旧版双兼容）:
+    - 自动识别 DSH 版本：新版走 Cookie 认证 + session/* 斜杠接口 + session/wait；
+      旧版走无认证的点号接口 + session.history 轮询；
+    - 本机认证读取 DSH 数据目录下的 `.credentials.yaml` 签名密钥自签 Cookie；
+      跨设备可用 dsh_url/dsh_token 的启动令牌；
     - 纯 Python + aiohttp（AstrBot 核心自带），Windows / Linux / macOS / Docker 通用；
     - AstrBot 与 DSH 可在不同设备（dsh_host 配置局域网 IP + DSH --trusted-host）。
 """
@@ -29,7 +31,7 @@ from astrbot.core.message.message_event_result import MessageChain
 
 from .dsh_client import DshClient, DshError
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 
 DEFAULT_INJECT_PROMPT = (
     "\n\n[DSH Bridge 系统提示]\n"
@@ -46,7 +48,7 @@ DEFAULT_INJECT_PROMPT = (
 )
 
 USAGE = (
-    f"DSH Bridge v{PLUGIN_VERSION}（适配 DSH 0.2.2-rc.1+）用法：\n"
+    f"DSH Bridge v{PLUGIN_VERSION}（兼容 DSH 0.2.2+ 与旧版）用法：\n"
     "  /dsh help            显示本帮助\n"
     "  /dsh ping            检测 DSH 连接状态\n"
     "  /dsh status          连接状态 + 当前配置摘要\n"
@@ -133,15 +135,23 @@ class Main(Star):
                 yield event.plain_result(f"❌ {exc}")
                 return
             lines = [f"✅ DSH 已连接：{info.get('base')}"]
+            protocol = info.get("protocol")
+            if protocol:
+                lines.append("   协议: " + ("旧版兼容模式" if protocol == "legacy" else "新版 0.2.x"))
             if info.get("version"):
                 lines.append(f"   版本: {info['version']}")
             auth = info.get("auth")
             if auth:
-                lines.append(
-                    "   认证: " + ("本机凭据文件" if auth == "credentials" else "启动令牌")
-                )
+                auth_label = {
+                    "credentials": "本机凭据文件",
+                    "token": "启动令牌",
+                    "none": "旧版无需认证",
+                }.get(str(auth), str(auth))
+                lines.append(f"   认证: {auth_label}")
             if info.get("sessions") is not None:
                 lines.append(f"   会话总数: {info['sessions']}，运行中: {info.get('running', 0)}")
+            if info.get("sessions_error"):
+                lines.append(f"   ⚠️ 会话查询失败（不影响连接）: {info['sessions_error']}")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -166,6 +176,9 @@ class Main(Star):
                 info = {"base": "未连接"}
                 yield event.plain_result(f"❌ {exc}")
             lines = [f"🌐 DSH: {info.get('base')}"]
+            protocol = info.get("protocol")
+            if protocol:
+                lines.append("   协议: " + ("旧版兼容模式" if protocol == "legacy" else "新版 0.2.x"))
             if info.get("version"):
                 lines.append(f"   版本: {info['version']}")
             cfg_lines = [

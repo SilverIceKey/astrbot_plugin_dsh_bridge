@@ -1,18 +1,18 @@
 name: astrbot_plugin_dsh_bridge
 display_name: DSH Bridge · AstrBot ↔ DeepSeek Harness 桥接
-short_desc: 让 AstrBot 智能体直接驱动本机/局域网上的 DeepSeek Harness（DSH 0.2.2-rc.1+）智能体：自动发现端口、Cookie 认证、任务投递与结果回传、自动 prompt 注入。
+short_desc: 让 AstrBot 智能体直接驱动本机/局域网上的 DeepSeek Harness（同时兼容新版 0.2.2+ 与旧版 DSH）智能体：自动发现端口、自动识别协议与认证、任务投递与结果回传、自动 prompt 注入。
 desc: |-
   # DSH Bridge —— AstrBot ↔ DeepSeek Harness 桥接插件
 
   让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**：
 
-  - **兼容 DSH 0.2.2-rc.1+**：适配 DSH 0.2.x 的本地 API 认证（读取 DSH 数据目录凭据自签浏览器 Cookie，或使用 `dsh web` 启动令牌）与新的 `session/*` 接口；
+  - **兼容新旧 DSH**：自动识别协议——新版 DSH（0.2.2+）使用 Cookie 认证与 `session/*` 斜杠接口，旧版 DSH 使用无认证的点号接口与 `session.history` 轮询；两种环境都能正常投递任务；
   - **LLM 工具注入**：AstrBot 主智能体自动获得 `dsh_ask`（把任务投递给 DSH 智能体并取回最终回复）与 `dsh_ping`（连通性检测）两个函数工具；
   - **Prompt 注入**：通过 `on_llm_request` 钩子向主智能体每次 LLM 请求的系统提示词自动追加使用说明（可开关、可自定义文本）；
   - **端口自动发现**：扫描回环端口（DSH Desktop 0.2.x 使用随机临时端口，默认扫描 32768-65535）用 HTTP 指纹识别 DSH Web 服务；可配置 `dsh_url` 直接固定地址；
   - **跨设备适配**：Windows / Linux / macOS / Docker 通用；AstrBot 与 DSH 不在同一台设备时，配置 `dsh_host` 为 DSH 所在设备的局域网 IP，并用 `dsh_url`/`dsh_token` 认证、DSH 侧加 `--trusted-host`；
   - **管理员命令**：`/dsh help` `/dsh ping` `/dsh scan` `/dsh status` `/dsh ask <任务>` `/dsh session <会话ID> <任务>`；
-  - **健壮性**：事件等待（`session/wait`）代替轮询、任务超时自动取消、结果长度截断防撑爆上下文、发现结果缓存、后台预热扫描。
+  - **健壮性**：新版事件等待（`session/wait`）与旧版轮询双路径、任务超时自动取消、结果长度截断防撑爆上下文、发现结果缓存、后台预热扫描。
 
   ## 快速开始
 
@@ -39,15 +39,16 @@ desc: |-
 
   ## 工作原理
 
-  1. **端口发现**：先尝试 `dsh_url`/`dsh_port`/`DSH_WEB_URL`/默认端口 59934，再按配置区间并发扫描回环端口（TCP 连通预筛 + HTTP 指纹确认，未认证时要求 401 认证提示文本）；
-  2. **认证**：DSH 0.2.x 的 `/api` 需要认证。插件默认读取 `$DSH_HOME/.credentials.yaml` 中 `client-connection/browser-session` 的签名密钥，自行签发 authority 绑定的浏览器会话 Cookie；也可用 `dsh web` 启动 URL 的 `?token=` 走 `/connect` 换取 API Cookie；
-  3. **调用**：向 DSH `/api/<method>` 发送 JSON 信封（`session/create` → `session/prompt` → `session/wait` 等待空闲，取 `assistant/message` 文本；超时 `session/cancel`）；
-  4. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
+  1. **端口发现**：先尝试 `dsh_url`/`dsh_port`/`DSH_WEB_URL`/默认端口 59934，再按配置区间并发扫描回环端口（TCP 连通预筛 + HTTP 指纹确认，自动跟随重定向，新版返回 401 认证提示、旧版返回页面标记）；
+  2. **协议识别**：先探测新版 `session/list`，失败再探测旧版 `session.list`，自动决定走哪条调用链；
+  3. **认证（仅新版）**：读取 `$DSH_HOME/.credentials.yaml` 中 `client-connection/browser-session` 的签名密钥，自行签发 authority 绑定的浏览器会话 Cookie；也可用 `dsh web` 启动 URL 的 `?token=` 走 `/connect` 换取 API Cookie；
+  4. **调用**：新版 `session/create` → `session/prompt` → `session/wait`；旧版 `session.create` → `session.prompt` → 轮询 `session.history` 至 `turn/end`；
+  5. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
 
-  > DSH 本地 API 仅绑定回环地址且需要浏览器会话认证；插件通过本机凭据文件或启动令牌完成认证。
+  > DSH 本地 API 仅绑定回环地址；新版需要浏览器会话认证，插件通过本机凭据文件或启动令牌完成认证。
   > 若 DSH 任务触发「需要用户确认」的审批，插件会提示到 DSH 窗口处理；无人值守场景可在 DSH 设置里调整默认权限预设。
 author: Fantasality
-version: 1.1.0
+version: 1.1.1
 repo: https://github.com/Fantasality/astrbot_plugin_dsh_bridge
 astrbot_version: ">=4.16.0"
 tags:
