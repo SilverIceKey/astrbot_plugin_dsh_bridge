@@ -1,8 +1,8 @@
 """AstrBot 插件：DSH Bridge —— 让 AstrBot 智能体驱动 DeepSeek Harness 智能体。
 
 功能:
-    1. 自动发现 DSH: 扫描 127.0.0.1 上的端口（默认 59934 优先），用 HTTP 指纹识别
-       DeepSeek Harness Web 服务；支持手动指定端口 / 局域网主机。
+    1. 自动发现 DSH: 扫描 127.0.0.1 上的临时端口段（或直接使用 dsh_url 配置的地址），
+       用 HTTP 指纹识别 DeepSeek Harness Web 服务；支持手动指定端口 / 局域网主机。
     2. LLM 工具注入: 向 AstrBot 主智能体注册 dsh_ask / dsh_ping 两个函数工具，
        AstrBot 智能体（即 AstrBot 的 agent）可直接调用，把任务投递给 DSH 智能体
        并把 DSH 的最终回复带回来。
@@ -11,9 +11,11 @@
     4. 管理员命令: /dsh ping / /dsh scan / /dsh ask <任务> / /dsh session <id> <任务>
        / /dsh status / /dsh help。
 
-适配性:
+适配性（DSH 0.2.2-rc.1+）:
+    - DSH 0.2.x 起本地 API 需要浏览器会话认证：本插件默认读取 DSH 数据目录下的
+      `.credentials.yaml` 签名密钥自签 Cookie；跨设备时可用 dsh_url/dsh_token 的启动令牌；
     - 纯 Python + aiohttp（AstrBot 核心自带），Windows / Linux / macOS / Docker 通用；
-    - AstrBot 与 DSH 可在不同设备（dsh_host 配置局域网 IP）。
+    - AstrBot 与 DSH 可在不同设备（dsh_host 配置局域网 IP + DSH --trusted-host）。
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ from astrbot.core.message.message_event_result import MessageChain
 
 from .dsh_client import DshClient, DshError
 
+PLUGIN_VERSION = "1.1.0"
+
 DEFAULT_INJECT_PROMPT = (
     "\n\n[DSH Bridge 系统提示]\n"
     "你拥有两个与 DeepSeek Harness（DSH，运行在用户电脑上的智能体）联动的工具：\n"
@@ -37,11 +41,12 @@ DEFAULT_INJECT_PROMPT = (
     "注意事项：\n"
     "1) 调用 dsh_ask 时，把用户意图完整、自包含地写成任务描述，不要省略上下文；\n"
     "2) dsh_ask 返回的是 DSH 智能体的最终回复，请如实转述关键内容，不要编造其未提供的信息；\n"
-    "3) 若 dsh_ping 显示 DSH 未连接，请告知用户 DSH 未运行或未被发现，并建议执行 /dsh scan 重新扫描。\n"
+    "3) 若 dsh_ping 显示 DSH 未连接，请告知用户 DSH 未运行或未被发现，并建议执行 /dsh scan 重新扫描；\n"
+    "4) 若 dsh_ask 结果显示「DSH 正在等待用户确认/回答」，请提示用户到 DSH 窗口处理后重试。\n"
 )
 
 USAGE = (
-    "DSH Bridge 用法：\n"
+    f"DSH Bridge v{PLUGIN_VERSION}（适配 DSH 0.2.2-rc.1+）用法：\n"
     "  /dsh help            显示本帮助\n"
     "  /dsh ping            检测 DSH 连接状态\n"
     "  /dsh status          连接状态 + 当前配置摘要\n"
@@ -128,15 +133,15 @@ class Main(Star):
                 yield event.plain_result(f"❌ {exc}")
                 return
             lines = [f"✅ DSH 已连接：{info.get('base')}"]
-            host_info = info.get("host") or {}
-            if isinstance(host_info, dict):
-                for key in ("name", "version", "app", "appName", "hostname"):
-                    if host_info.get(key):
-                        lines.append(f"   {key}: {host_info[key]}")
+            if info.get("version"):
+                lines.append(f"   版本: {info['version']}")
+            auth = info.get("auth")
+            if auth:
+                lines.append(
+                    "   认证: " + ("本机凭据文件" if auth == "credentials" else "启动令牌")
+                )
             if info.get("sessions") is not None:
                 lines.append(f"   会话总数: {info['sessions']}，运行中: {info.get('running', 0)}")
-            if info.get("sessions_error"):
-                lines.append(f"   ⚠️ 会话查询失败: {info['sessions_error']}")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -149,7 +154,9 @@ class Main(Star):
             except DshError as exc:
                 yield event.plain_result(f"❌ {exc}")
                 return
-            yield event.plain_result(f"✅ 扫描完成，DSH 位于 {found}（已缓存，可配置 dsh_port 固定端口）")
+            yield event.plain_result(
+                f"✅ 扫描完成，DSH 位于 {found}（已缓存；也可配置 dsh_url 直接固定地址）"
+            )
             return
 
         if action == "status":
@@ -159,10 +166,15 @@ class Main(Star):
                 info = {"base": "未连接"}
                 yield event.plain_result(f"❌ {exc}")
             lines = [f"🌐 DSH: {info.get('base')}"]
+            if info.get("version"):
+                lines.append(f"   版本: {info['version']}")
             cfg_lines = [
                 ("host", self.client.host),
+                ("dsh_url", self._cfg("dsh_url", "") or "（未配置，自动发现）"),
                 ("port(0=自动)", self.client.port_override),
-                ("区间", self._cfg("port_ranges", "默认")),
+                ("扫描区间", self._cfg("port_ranges", "默认")),
+                ("DSH数据目录", str(self.client.dsh_home)),
+                ("启动令牌", "已配置" if self.client.token else "未配置"),
                 ("缓存TTL(s)", self.client.cache_ttl),
                 ("任务超时(s)", self._cfg("request_timeout_seconds", 900)),
                 ("默认cwd", self._cfg("default_cwd", "") or "（DSH 默认）"),
@@ -220,6 +232,11 @@ class Main(Star):
             head = (
                 f"✅ DSH 执行完成（会话 {result['sessionId']}，用时 {self._fmt_duration(result['duration_ms'])}）:\n\n"
             )
+            if result.get("pending_input"):
+                head = (
+                    f"⏳ DSH 正在等待用户确认/回答（会话 {result['sessionId']}，"
+                    f"已等待 {self._fmt_duration(result['duration_ms'])}）:\n\n"
+                )
             yield event.plain_result(head + result["text"])
             return
 
@@ -255,8 +272,9 @@ class Main(Star):
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("[DSH Bridge] dsh_ask 工具异常")
             return f"[DSH Bridge] 插件内部错误：{exc}"
+        label = "执行结果" if not result.get("pending_input") else "等待用户确认/回答"
         return (
-            f"[DSH Bridge] DSH 智能体执行结果（会话 {result['sessionId']}，"
+            f"[DSH Bridge] DSH 智能体{label}（会话 {result['sessionId']}，"
             f"用时 {self._fmt_duration(result['duration_ms'])}）：\n{result['text']}"
         )
 
@@ -271,6 +289,8 @@ class Main(Star):
         except DshError as exc:
             return f"[DSH Bridge] DSH 未连接：{exc}"
         lines = [f"[DSH Bridge] DSH 在线：{info.get('base')}"]
+        if info.get("version"):
+            lines.append(f"版本 {info['version']}")
         if info.get("sessions") is not None:
             lines.append(f"会话总数 {info['sessions']}，运行中 {info.get('running', 0)}")
         return "\n".join(lines)

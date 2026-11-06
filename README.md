@@ -1,26 +1,30 @@
 # AstrBot Plugin: DSH Bridge
 
-让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**：
+让 **AstrBot 的智能体可以直接操纵 DeepSeek Harness（DSH）的智能体**（适配 **DSH 0.2.2-rc.1+**）：
 
 - AstrBot 主智能体获得两个函数工具 —— `dsh_ask`（把任务投递给 DSH 智能体并取回最终回复）和 `dsh_ping`（连通性检测）；
 - 插件通过 `on_llm_request` 钩子向主智能体的系统提示词**自动注入使用说明**（可开关、可自定义）；
-- 自动**扫描 127.0.0.1 端口**发现 DSH Web 服务（默认端口 59934 优先，失败则全量扫描回环端口），无需在 DSH 侧安装任何东西；
-- 适配不同设备：Windows / Linux / macOS / Docker 通用；AstrBot 与 DSH 不在同一台机器时，把 `dsh_host` 配成 DSH 所在设备的局域网 IP 即可。
+- 自动**扫描回环端口**发现 DSH Web 服务（DSH 0.2.x Desktop 使用随机临时端口，默认扫描 `32768-65535`），也可用 `dsh_url` 直接固定地址；
+- 自动完成 **DSH 0.2.x 的 API 认证**：默认读取 DSH 数据目录下的凭据文件自签浏览器会话 Cookie；跨设备场景可用 `dsh web` 启动 URL 的 `?token=`；
+- 适配不同设备：Windows / Linux / macOS / Docker 通用。
 
 ```
-┌──────────────┐   llm_tool 调用   ┌──────────────────────┐   HTTP/JSON (无鉴权)   ┌──────────────────────┐
-│  AstrBot 智能体 │ ───────────────▶ │  dsh_bridge 插件      │ ─────────────────────▶ │  DeepSeek Harness     │
-│  (聊天/群聊)    │ ◀─────────────── │  端口扫描+会话投递    │ ◀───────────────────── │  (127.0.0.1:59934)    │
-└──────────────┘   prompt 注入       └──────────────────────┘   session.prompt 等    └──────────────────────┘
+┌──────────────┐   llm_tool 调用   ┌──────────────────────┐   HTTP/JSON（Cookie 认证）   ┌──────────────────────┐
+│  AstrBot 智能体 │ ───────────────▶ │  dsh_bridge 插件      │ ─────────────────────────▶ │  DeepSeek Harness     │
+│  (聊天/群聊)    │ ◀─────────────── │  端口扫描+会话投递    │ ◀───────────────────────── │  (127.0.0.1:<随机端口>) │
+└──────────────┘   prompt 注入       └──────────────────────┘   session/* 接口            └──────────────────────┘
 ```
+
+> **兼容性说明**：DSH 0.2.x 起把本地 API 从「无鉴权」改为「必须浏览器会话认证」，并把 RPC 方法名从 `session.create` 这类点号命名改为 `session/create` 斜杠命名、参数改为命名参数、完成判定改为 `session/wait` 事件等待。本插件 1.1.0 已按 **DSH 0.2.2-rc.1** 的接口重写；1.0.0 只适用于更早的无鉴权 DSH。
 
 ---
 
 ## 一、环境要求
 
 - **AstrBot ≥ 4.16**（本插件基于 AstrBot 4.26 规范开发，`astrbot_version: ">=4.16.0"`）
-- **DeepSeek Harness** 正在运行（DSH Desktop 桌面版，或 `dsh web` 命令行版）
-- 零额外依赖：插件只用 Python 标准库 + `aiohttp`（AstrBot 核心自带）
+- **DeepSeek Harness 0.2.2-rc.1 或更新版本** 正在运行（DSH Desktop 桌面版，或 `dsh web` 命令行版）
+- 插件只用 Python 标准库 + `aiohttp`（AstrBot 核心自带）；读取 YAML 凭据时优先用 PyYAML，缺失时自动降级为内置解析
+- **本机认证方式要求 AstrBot 与 DSH 以同一操作系统用户运行**（插件需要读取 DSH 数据目录下的 `.credentials.yaml`）
 
 ## 二、安装
 
@@ -46,20 +50,48 @@
 
 ```bash
 cd data/plugins
-git clone https://github.com/Fantasality/astrbot_plugin_dsh_bridge.git
+git clone https://github.com/SilverIceKey/astrbot_plugin_dsh_bridge.git
 ```
 
-## 三、配置（插件设置页，均可改后即时生效）
+## 三、认证说明（DSH 0.2.x 必读）
+
+DSH 0.2.x 的 Web/API 需要认证，本插件按以下顺序自动选择：
+
+1. **本机凭据文件（默认，推荐）**
+   插件读取 DSH 数据目录下的 `.credentials.yaml`，取
+   `records["client-connection/browser-session"].payload.secret` 作为 HMAC 签名密钥，
+   自行签发与 `host:port` 绑定的浏览器会话 Cookie 去调用 `/api`。
+   - 数据目录解析顺序：`dsh_home` 配置 → 环境变量 `DSH_HOME` → `~/.dsh`
+   - 该 Cookie 由 DSH 的持久密钥签名，**DSH 重启后依然有效**
+   - 需要 AstrBot 与 DSH 同用户、同机器（或至少能读到该文件）
+
+2. **启动令牌（跨设备 / 读不到凭据文件时）**
+   把 `dsh web` 启动输出里带 `?token=...` 的 **完整 URL** 填到 `dsh_url`（或只把 token 填到 `dsh_token`），
+   插件会调用 `GET /connect?token=...&interactions=none` 换取 API Cookie。
+   - 令牌**每次 DSH 重启都会变化**，需要重新填写
+   - 跨设备时 DSH 需以 `--trusted-host <本插件访问用的 host:port>` 启动，否则 `/api` 返回 403
+
+3. **两条都不可用**
+   `/dsh ping` 会明确提示缺失的凭据文件路径或跨设备配置方法。
+
+> 安全提示：本机凭据文件里的签名密钥等价于本机 DSH 的完整控制权。请只在可信环境安装本插件，
+> 不要把 AstrBot 或 DSH 的端口暴露到公网。
+
+## 四、配置（插件设置页，均可改后即时生效）
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `dsh_host` | `127.0.0.1` | DSH 所在主机；跨设备时填局域网 IP |
+| `dsh_url` | 空 | 直接指定 DSH 地址（可带 `?token=`），跳过扫描；**最省事的固定方式** |
 | `dsh_port` | `0` | 手动指定 DSH 端口；`0` = 自动扫描 |
-| `port_ranges` | `59900-60100,49152-60000,32768-60999` | 自动扫描区间（默认端口 59934 总是优先） |
-| `scan_concurrency` | `256` | 扫描并发，弱机调低 |
+| `port_ranges` | `32768-65535` | 自动扫描区间（覆盖 Windows/Linux 临时端口段） |
+| `scan_concurrency` | `512` | 扫描并发，弱机调低（如 64） |
+| `port_probe_timeout_seconds` | `0.3` | 单端口 TCP 探测超时 |
 | `cache_ttl_seconds` | `300` | 端口发现结果缓存时长 |
+| `dsh_home` | 空 | DSH 数据目录（含 `.credentials.yaml`），留空用 `DSH_HOME` 或 `~/.dsh` |
+| `dsh_token` | 空 | `dsh web` 启动 URL 中的 token（跨设备/无凭据文件时使用） |
 | `request_timeout_seconds` | `900` | 单个任务执行超时，超时自动取消 |
-| `poll_interval_seconds` | `2.0` | 结果轮询间隔 |
+| `poll_interval_seconds` | `2.0` | 兼容项：`session/wait` 已事件驱动，仅用于投递瞬间的空闲误判重试 |
 | `max_result_chars` | `6000` | 返回文本截断长度，防撑爆上下文 |
 | `default_cwd` | 空 | 新建 DSH 会话的工作目录；空 = DSH 默认 |
 | `session_mode` | `new` | `new` 每次新建会话；`persistent` 复用固定会话 |
@@ -67,13 +99,13 @@ git clone https://github.com/Fantasality/astrbot_plugin_dsh_bridge.git
 | `inject_prompt_enabled` | `true` | 是否向主智能体注入使用说明 |
 | `inject_prompt_text` | 内置模板 | 注入的提示词内容，可完全自定义 |
 
-## 四、使用
+## 五、使用
 
 ### 管理员命令（需在消息平台触发 AstrBot 唤醒后输入）
 
 ```
 /dsh help                   查看帮助
-/dsh ping                   检测 DSH 连接状态
+/dsh ping                   检测 DSH 连接状态（含 DSH 版本、认证方式）
 /dsh status                 连接状态 + 配置摘要
 /dsh scan                   强制重新扫描端口（改过配置后可用）
 /dsh ask <任务描述>          把任务交给 DSH 智能体执行，返回最终回复
@@ -81,9 +113,11 @@ git clone https://github.com/Fantasality/astrbot_plugin_dsh_bridge.git
 ```
 
 示例：
+
 ```
 /dsh ask 帮我在电脑上查一下 C 盘剩余空间，并生成一份磁盘使用报告
 ```
+
 插件会先回复「📡 已接入 DSH 会话 …」，DSH 智能体执行完后返回其最终回复。
 
 ### 让 AstrBot 主智能体自动调用
@@ -97,52 +131,79 @@ git clone https://github.com/Fantasality/astrbot_plugin_dsh_bridge.git
 
 主智能体会自行决定何时调用工具，并把 DSH 的回复转述给你。
 
-## 五、工作原理（给好奇的人）
+### 审批（approval）注意事项
 
-1. **端口发现**：DSH Desktop 默认把 Web 服务绑在 `127.0.0.1:59934`（被占用则回退到系统随机端口）。
-   插件先探测 59934，再按配置区间并发扫描回环端口；对每个端口先做 TCP 连通预筛，再 GET `/`
-   检查页面标题是否含 `DeepSeek Harness` / 是否含 `__DSH_BOOT__` 指纹标记。
-2. **调用**：向 DSH 的 `/api/<method>` 发送 JSON 信封
-   `{"type":"client-request","rpcId":"<uuid>","method":"...","payload":{...}}`：
-   - `session.create` → 新建会话（默认每次任务一个独立会话）
-   - `session.prompt` → 投递任务（`mode: "queue"`）
-   - `session.history` 轮询 → 直到出现 `turn/end` 事件，从 `assistant/message` 事件中取最终文本
-   - 超时 → `session.cancel` 取消并报错
-3. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
+DSH 默认权限预设会在执行写文件、跑命令等操作前**请求用户确认**。桥接插件无法替用户点「允许」，
+此时 `/dsh ask` 会返回「DSH 正在等待用户确认/回答」，并保留该轮任务：
 
-> 该 API 仅绑定回环地址且无鉴权，因此插件无需任何密钥即可驱动本机 DSH。
+- 到 DSH 窗口处理审批后，可再次 `/dsh ask`，或直接用 `/dsh session <会话ID> <任务>` 继续该会话；
+- 无人值守场景，可在 DSH 设置里把默认权限预设调整为不需要询问的模式（例如 `danger-full-access`，
+  其审批策略为 `never`）；这相当于把整台电脑交给该智能体，请自行评估风险。
 
-## 六、常见问题
+## 六、工作原理（给好奇的人）
+
+1. **端口发现**：DSH 0.2.x Desktop 以 `--port 0` 启动，Web 端口是系统随机临时端口。
+   插件先尝试 `dsh_url` / `dsh_port` / `DSH_WEB_URL` / 历史默认端口 `59934`，再按 `32768-65535`
+   并发扫描：对每个端口先做 TCP 连通预筛，再 `GET /` 检查指纹——
+   未认证时 DSH 返回 401 文本 `dsh web authentication required; ...`；
+   认证后返回含 `DeepSeek Harness` / `__DSH_BOOT__` 的 index.html（还能读到 `release.version`）。
+   指纹命中后，再用 `session/list` 做一次认证校验，确保选中的是真正可用的 DSH。
+2. **认证**：见第三节。本机默认用 `.credentials.yaml` 中的 `browser-session` 签名密钥
+   （32 字节 base64url）签发 `dsh-auth-<authority 哈希>` Cookie：
+   `v1.<payload>.<HMAC-SHA256>`，payload 含 `authority` / `issuedAt` / `expiresAt`。
+3. **调用**：向 DSH 的 `/api/<method>` 发送 JSON 信封
+   `{"type":"client-request","rpcId":"<uuid>","method":"...","payload":{"args":{...}}}`：
+   - `session/create` → 新建会话（默认每次任务一个独立会话）
+   - `session/state` → 读取投递前的事件游标
+   - `session/prompt` → 投递任务（`mode: "queue"`，带客户端生成的 `requestId`）
+   - `session/wait` → 阻塞等待会话空闲，`output.records` 中取 `assistant/message` 的文本块
+   - 超时 → `session/cancel` 取消并报错；需要用户审批 → 返回「等待确认」并保留任务
+4. **Prompt 注入**：`on_llm_request` 钩子在每次 LLM 请求的 `system_prompt` 末尾追加工具使用说明。
+
+## 七、常见问题
 
 | 现象 | 处理 |
 | --- | --- |
-| `/dsh ping` 提示未发现 DSH | 1) 确认 DSH Desktop 已打开；2) 看 DSH 窗口地址栏端口，填入 `dsh_port`；3) 或执行 `/dsh scan` 强制重扫 |
-| 扫描很慢 | 调小 `port_ranges`（只留 `59900-60100`），或直接填 `dsh_port` 跳过扫描 |
-| AstrBot 在服务器/Docker，DSH 在台式机 | `dsh_host` 填台式机局域网 IP；确认防火墙放行该端口 |
+| `/dsh ping` 提示未发现 DSH | 1) 确认 DSH Desktop 已打开；2) 把 DSH 窗口地址栏的完整 URL（含 `?token=`）填入 `dsh_url` 最省事；3) 或执行 `/dsh scan` 强制重扫 |
+| 401 / 「DSH 要求认证」 | 本机：确认 `dsh_home` 指向 DSH 数据目录（默认 `~/.dsh`），且 AstrBot 与 DSH 同用户；跨设备：配置 `dsh_url`/`dsh_token` |
+| 403 / 「来源地址不在信任列表」 | 跨设备访问需给 DSH 加 `--trusted-host <本插件访问用的 host:port>` 并重启 |
+| 扫描很慢 | DSH 端口是随机的，全量扫描约 10-20 秒；确定端口后填 `dsh_url` 或 `dsh_port` 可秒连 |
+| 任务一直「等待用户确认」 | 到 DSH 窗口处理审批；或调整 DSH 默认权限预设 |
 | 任务超时被取消 | 调大 `request_timeout_seconds`；长任务建议拆分成小任务 |
 | 返回内容过长 | 调大 `max_result_chars`（注意上下文占用） |
-| 工具报「DSH 拒绝了 session.prompt」 | 多为会话已关闭，切回 `session_mode: new` 或更换会话 ID |
+| 工具报 `session/not-found` 等错误 | 多为会话已关闭/被归档，切回 `session_mode: new` 或更换会话 ID |
+| 提示方法 404 | DSH 版本过旧，请升级到 0.2.2-rc.1+ |
 
-## 七、安全说明
+## 八、安全说明
 
-- DSH 的本地 API 无鉴权但**仅绑定 127.0.0.1**；请勿把 `dsh_host` 暴露到公网。
+- DSH 的本地 API 现在需要会话认证，但仍**只应在本机/可信网络使用**；请勿把 DSH 端口或 AstrBot 暴露到公网。
+- 本机凭据文件中的签名密钥、`dsh_token` 等价于 DSH 的完整控制权；插件不会打印它们，请妥善保管配置文件。
 - `/dsh` 系列命令仅 **管理员** 可用（`permission_type(ADMIN)`）；`dsh_ask` 工具仅 AstrBot 智能体
-  能触发，且每个任务都是独立 DSH 会话，任务间互不干扰。
+  能触发，且每个任务默认是独立 DSH 会话，任务间互不干扰。
 - DSH 智能体拥有本机工具（命令执行、文件读写等），本质上等同于授权 AstrBot 代为操作电脑，
   请仅在可信的聊天环境启用本插件。
 
-## 八、文件清单
+## 九、文件清单
 
 ```
 astrbot_plugin_dsh_bridge/
 ├── metadata.yaml        # 插件元数据（name/desc/author/version/astrbot_version）
 ├── main.py              # Star 主类：/dsh 命令 + dsh_ask/dsh_ping 工具 + prompt 注入
-├── dsh_client.py        # DSH API 客户端：端口发现、RPC、任务投递与轮询
+├── dsh_client.py        # DSH API 客户端：端口发现、Cookie 认证、RPC、任务投递与事件等待
 ├── _conf_schema.json    # 插件配置面板 schema
+├── tests/
+│   └── test_dsh_client.py  # 纯函数单元测试（python -m unittest discover -s tests -v）
 └── README.md            # 本文档
 ```
 
-## 九、Changelog
+## 十、Changelog
 
+- **1.1.0** 适配 DSH 0.2.2-rc.1+：
+  - 新增 DSH 0.2.x API 认证（本机 `.credentials.yaml` 自签浏览器 Cookie / `dsh web` 启动令牌换取 API Cookie）；
+  - RPC 改为 `session/create`、`session/prompt`、`session/state`、`session/wait` 等斜杠方法名与命名参数信封；
+  - 完成判定改用 `session/wait` 事件等待，去掉高频轮询；`session/wait` 报告 `input-required` 时保留任务并提示审批；
+  - 端口发现默认扫描 `32768-65535`（DSH Desktop 0.2.x 随机临时端口），支持 `dsh_url` 直接固定地址，优化并发扫描速度；
+  - `/dsh ping` 显示 DSH 版本与认证方式；新增 `dsh_home`、`dsh_url`、`dsh_token` 配置；
+  - 新增 `tests/` 单元测试。
 - **1.0.0** 首个版本：端口自动发现、`/dsh` 命令组、`dsh_ask`/`dsh_ping` LLM 工具、prompt 注入、
   跨设备 host 配置、任务超时自动取消、结果截断。

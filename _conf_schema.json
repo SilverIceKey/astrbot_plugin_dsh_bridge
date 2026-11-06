@@ -2,8 +2,14 @@
   "dsh_host": {
     "type": "string",
     "name": "DSH 主机地址",
-    "description": "DeepSeek Harness 所在主机。默认 127.0.0.1（本机）；AstrBot 与 DSH 不在同一设备时填写 DSH 所在设备的局域网 IP。",
+    "description": "DeepSeek Harness 所在主机。默认 127.0.0.1（本机）；AstrBot 与 DSH 不在同一设备时填写 DSH 所在设备的局域网 IP（同时需配置 dsh_url 或 dsh_token，并给 DSH 加 --trusted-host）。",
     "default": "127.0.0.1"
+  },
+  "dsh_url": {
+    "type": "string",
+    "name": "DSH 地址（可选，推荐）",
+    "description": "直接填写 DSH Web 地址，跳过端口扫描。可填 DSH 窗口地址栏或 `dsh web` 启动输出中的完整 URL（含 ?token=... 时会自动用启动令牌认证），例如 http://127.0.0.1:53833/?token=xxxx。留空则自动扫描端口。",
+    "default": ""
   },
   "dsh_port": {
     "type": "int",
@@ -14,26 +20,38 @@
   "port_ranges": {
     "type": "string",
     "name": "自动扫描端口区间",
-    "description": "逗号分隔的区间，如 59900-60100,49152-60000。默认端口 59934 总会优先尝试。",
-    "default": "59900-60100,49152-60000,32768-60999"
+    "description": "逗号分隔的区间。DSH 0.2.x Desktop 以随机临时端口启动，默认扫描 32768-65535 覆盖 Windows/Linux 临时端口段；确定端口时建议直接配置 dsh_port 或 dsh_url。",
+    "default": "32768-65535"
   },
   "scan_concurrency": {
     "type": "int",
     "name": "扫描并发数",
-    "description": "端口扫描的并发连接数。弱机/容器环境可调低（如 64）。",
-    "default": 256
+    "description": "端口扫描的并发连接数，默认 512。弱机/容器环境可调低（如 64）；全量扫描 32768-65535 在 1024 并发下约需 10-20 秒。",
+    "default": 512
   },
   "port_probe_timeout_seconds": {
     "type": "float",
     "name": "端口探测超时（秒）",
-    "description": "单个端口 TCP 连接超时，默认 0.4 秒。",
-    "default": 0.4
+    "description": "单个端口 TCP 连接超时，默认 0.3 秒（Windows 上未开放端口可能被防火墙静默丢弃，超时值越小扫描越快）。",
+    "default": 0.3
   },
   "cache_ttl_seconds": {
     "type": "int",
     "name": "发现结果缓存时长（秒）",
     "description": "端口发现结果在内存中的缓存时长，过期后自动重新探测。",
     "default": 300
+  },
+  "dsh_home": {
+    "type": "string",
+    "name": "DSH 数据目录",
+    "description": "DSH 数据目录（含 .credentials.yaml）。留空时依次使用环境变量 DSH_HOME、~/.dsh。本机认证需要读取该目录下 .credentials.yaml 里的 browser-session 密钥。",
+    "default": ""
+  },
+  "dsh_token": {
+    "type": "string",
+    "name": "DSH 启动令牌（可选）",
+    "description": "`dsh web` 启动输出 URL 中的 token 参数。用于无法读取本机凭据文件的场景（如跨设备）。令牌每次 DSH 重启后变化，需要重新填写；也可以直接把带 token 的完整 URL 填到 dsh_url。",
+    "default": ""
   },
   "request_timeout_seconds": {
     "type": "int",
@@ -43,8 +61,8 @@
   },
   "poll_interval_seconds": {
     "type": "float",
-    "name": "结果轮询间隔（秒）",
-    "description": "等待 DSH 执行完成时的轮询间隔。",
+    "name": "轮询间隔（秒，兼容项）",
+    "description": "DSH 0.2.2 起使用 session/wait 事件等待，无需轮询；此值仅用于会话刚投递时的空闲误判重试间隔。",
     "default": 2.0
   },
   "max_result_chars": {
@@ -81,6 +99,6 @@
     "type": "text",
     "name": "注入的 Prompt 内容",
     "description": "追加到系统提示词末尾的说明文本。修改后无需重启，立即生效。",
-    "default": "\n\n[DSH Bridge 系统提示]\n你拥有两个与 DeepSeek Harness（DSH，运行在用户电脑上的智能体）联动的工具：\n- dsh_ask：把任务委托给 DSH 智能体执行，并返回它的最终回复；\n- dsh_ping：检测 DSH 是否在线。\n使用时机：任务需要在用户电脑上完成（运行命令、读写文件、访问本地数据、长时间后台工作等），或用户明确要求「交给电脑上的智能体 / DSH」时。\n注意事项：\n1) 调用 dsh_ask 时，把用户意图完整、自包含地写成任务描述，不要省略上下文；\n2) dsh_ask 返回的是 DSH 智能体的最终回复，请如实转述关键内容，不要编造其未提供的信息；\n3) 若 dsh_ping 显示 DSH 未连接，请告知用户 DSH 未运行或未被发现，并建议执行 /dsh scan 重新扫描。\n"
+    "default": "\n\n[DSH Bridge 系统提示]\n你拥有两个与 DeepSeek Harness（DSH，运行在用户电脑上的智能体）联动的工具：\n- dsh_ask：把任务委托给 DSH 智能体执行，并返回它的最终回复；\n- dsh_ping：检测 DSH 是否在线。\n使用时机：任务需要在用户电脑上完成（运行命令、读写文件、访问本地数据、长时间后台工作等），或用户明确要求「交给电脑上的智能体 / DSH」时。\n注意事项：\n1) 调用 dsh_ask 时，把用户意图完整、自包含地写成任务描述，不要省略上下文；\n2) dsh_ask 返回的是 DSH 智能体的最终回复，请如实转述关键内容，不要编造其未提供的信息；\n3) 若 dsh_ping 显示 DSH 未连接，请告知用户 DSH 未运行或未被发现，并建议执行 /dsh scan 重新扫描；\n4) 若 dsh_ask 结果显示「DSH 正在等待用户确认/回答」，请提示用户到 DSH 窗口处理后重试。\n"
   }
 }
